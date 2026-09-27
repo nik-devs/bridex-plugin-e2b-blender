@@ -1,5 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
+import { Template } from "e2b";
+import { blenderTemplate, templateName } from "./template/template.mjs";
 
 /**
  * e2b-blender: Blender for Bridex agents in an E2B sandbox.
@@ -9,6 +11,11 @@ import path from "node:path";
  * extended on every call and while background jobs run, stopped by
  * blender_stop, after idle_s without calls, or at max_life_s. E2B's own timer
  * backs this up: a sandbox dies on its timeout even if the instance is down.
+ *
+ * The template is built by the plugin in the E2B account of the instance's
+ * own key (a template belongs to one E2B team): on activation it checks for
+ * the template matching this version's files and, if missing, builds it in
+ * the background — first use waits for that once, then sandboxes start fast.
  *
  * Inside the sandbox (template/ in this repo): headless Blender with the MCP
  * for Blender addon, the MCP server on :8000/mcp, and a small job/file API on
@@ -33,7 +40,10 @@ export default async function activate(ctx) {
   const cfg = ctx.config ?? {};
   const resolve = (v) => String(v ?? "").replace(/\$\{([A-Z0-9_]+)\}/g, (_, n) => process.env[n] ?? "");
   const apiKey = resolve(cfg.api_key || "${E2B_API_KEY}");
-  const template = String(cfg.template || "bridex-blender");
+  // a set template name is used as is; empty (or the old shared default) =
+  // the plugin's own build, named by the hash of its files
+  const custom = cfg.template && cfg.template !== "bridex-blender" ? String(cfg.template) : null;
+  const template = custom ?? templateName();
   const idleS = Number(cfg.idle_s) > 0 ? Number(cfg.idle_s) : 300;
   const maxLifeS = Number(cfg.max_life_s) > 0 ? Number(cfg.max_life_s) : 3600;
   const syncS = Math.min(170, Number(cfg.sync_s) > 0 ? Number(cfg.sync_s) : 150);
@@ -73,6 +83,88 @@ export default async function activate(ctx) {
     }
     return text ? JSON.parse(text) : {};
   };
+
+  // -- the template in this account ------------------------------------------
+
+  const tplFile = path.join(stateDir, "template.json");
+  /** {status: checking|building|ready|error, name, templateId?, buildId?, startedAt?, error?} */
+  let tpl = { status: custom ? "ready" : "checking", name: template };
+  try {
+    const saved = JSON.parse(fs.readFileSync(tplFile, "utf8"));
+    if (!custom && saved.name === template) tpl = saved;
+  } catch {
+    /* none yet */
+  }
+  const saveTpl = () => fs.writeFileSync(tplFile, JSON.stringify(tpl, null, 2));
+  let tplPoll = null;
+
+  async function pollBuild() {
+    try {
+      const st = await Template.getBuildStatus({ templateId: tpl.templateId, buildId: tpl.buildId }, { apiKey });
+      if (st.status === "ready") {
+        log.info(`template ${template} built in ${Math.round((Date.now() - (tpl.startedAt ?? Date.now())) / 60000)} min`);
+        tpl = { status: "ready", name: template };
+      } else if (st.status === "error") {
+        tpl = { ...tpl, status: "error", error: st.reason?.message ?? "build failed" };
+        log.warn(`template ${template} build failed: ${tpl.error}`);
+      }
+      saveTpl();
+    } catch (e) {
+      log.warn(`template build status: ${e.message}`);
+    }
+    if (tpl.status === "building") tplPoll = setTimeout(pollBuild, 20_000);
+  }
+
+  // one check/start at a time: activation and a Check click racing each other
+  // started two builds of the same template
+  let ensuring = null;
+  function ensureTemplate(opts) {
+    ensuring ??= startTemplate(opts).finally(() => (ensuring = null));
+    return ensuring;
+  }
+
+  async function startTemplate({ retry = false } = {}) {
+    if (custom || tpl.status === "ready") return;
+    if (tpl.status === "building") {
+      if (!tplPoll) void pollBuild();
+      return;
+    }
+    if (tpl.status === "error" && !retry) return;
+    try {
+      if (await Template.aliasExists(template, { apiKey })) {
+        tpl = { status: "ready", name: template };
+        saveTpl();
+        return;
+      }
+      const b = await Template.buildInBackground(blenderTemplate(), template, { apiKey, cpuCount: 4, memoryMB: 8192 });
+      tpl = { status: "building", name: template, templateId: b.templateId, buildId: b.buildId, startedAt: Date.now() };
+      saveTpl();
+      log.info(`building template ${template} in this E2B account (first use)`);
+      tplPoll = setTimeout(pollBuild, 20_000);
+    } catch (e) {
+      tpl = { status: "error", name: template, error: e.message };
+      saveTpl();
+      log.warn(`template ${template}: ${e.message}`);
+    }
+  }
+
+  /** Why a sandbox cannot start yet, or null when the template is there. */
+  function templateNotReady() {
+    if (tpl.status === "ready") return null;
+    if (tpl.status === "error")
+      return `The Blender sandbox template could not be built in this instance's E2B account: ${tpl.error}. A person can retry with Check in Settings → Plugins → e2b-blender.`;
+    if (tpl.status === "checking") return "The Blender sandbox template is being checked in this instance's E2B account — try again in a minute.";
+    const mins = tpl.startedAt ? Math.round((Date.now() - tpl.startedAt) / 60000) : 0;
+    return `The Blender sandbox template is being built in this instance's E2B account — first use only, usually 5–10 min${mins ? ` (started ${mins} min ago)` : ""}. Set remind_me for 10 minutes and continue then; nothing is lost.`;
+  }
+
+  if (typeof ctx.registerCheck === "function")
+    ctx.registerCheck(async () => {
+      await ensureTemplate({ retry: true });
+      const why = templateNotReady();
+      return why ? { ok: false, message: why } : { ok: true, message: `template ${template} ready` };
+    });
+  void ensureTemplate();
 
   const keyOf = (call) => `${call.workspace}:${call.taskId ?? call.sessionKey ?? call.agent}`;
   const hostOf = (box, port) => `https://${port}-${box.id}.${box.domain || "e2b.app"}`;
@@ -140,6 +232,8 @@ export default async function activate(ctx) {
         forget(key, "gone");
       }
     }
+    const why = templateNotReady();
+    if (why) throw new Error(why);
     const t0 = Date.now();
     const s = await e2b("POST", "/sandboxes", {
       templateID: template,

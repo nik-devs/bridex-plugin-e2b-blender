@@ -27,7 +27,7 @@ Catalog install from Settings → Plugins, or drop this folder into
 
 ```yaml
 api_key: ${E2B_API_KEY}   # or the key itself
-template: bridex-blender  # built from template/
+template: ""             # empty = the plugin builds its own in your account
 idle_s: 300
 max_life_s: 3600
 sync_s: 150
@@ -40,11 +40,12 @@ price_per_hour_usd: 0.33  # 4 vCPU / 8 GB at E2B list prices
 (unchanged, served over HTTP on :8000/mcp) + a small stdlib job/file API on :8001
 (`bridex_api.py`). `headless.py` runs the addon in `blender -b` (its timer-driven
 queue does not tick without a UI) and renders previews with Cycles on the CPU.
-Build in E2B's cloud, no local Docker:
 
-```sh
-cd template && E2B_API_KEY=… python build.py bridex-blender
-```
-
-CI does the same on every push that touches `template/` (`.github/workflows/template.yml`,
-repo secret `E2B_API_KEY`; also runnable by hand from the Actions tab).
+A template belongs to one E2B team, so the plugin builds it itself, in the
+account of the key it is given (`template/template.mjs`): on activation it looks
+for `bridex-blender-<hash of the template files>` and, when missing, builds it in
+E2B's cloud in the background. Agents asking for Blender meanwhile are told to
+come back in a few minutes; Settings → Plugins → Check shows the state (and
+retries a failed build). A new plugin version with changed template files builds
+its own new template the same way. Set `template` in the config only to use one
+you built yourself.

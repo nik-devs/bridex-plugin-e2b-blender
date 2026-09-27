@@ -3,7 +3,7 @@
 # finish, writes artifacts with provenance and records spend — in-process
 # facilities a catalog "tool" plugin (out of process) does not get.
 name: e2b-blender
-version: 0.1.2
+version: 0.2.0
 kind: integration
 description: Blender for agents in an isolated cloud sandbox (E2B) — Python in a live scene, script files from skills, long renders that run in the background and wake the agent, previews, files in and out of artifacts.
 entry: index.mjs
@@ -20,8 +20,7 @@ config_schema:
     template:
       type: string
       title: Sandbox template
-      default: bridex-blender
-      description: E2B template built from template/ in this plugin's repo
+      description: Leave empty — the plugin builds its own template in your E2B account on first use (5–10 min, once). Set a name only to use a template you built yourself
     idle_s:
       type: integer
       title: Stop after idle, seconds
