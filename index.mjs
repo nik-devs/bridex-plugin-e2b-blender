@@ -457,7 +457,7 @@ export default async function activate(ctx) {
 
   ctx.registerTool({
     name: "blender_preview",
-    description: "Look at the live scene: a quick Cycles CPU render (through the scene camera, or an automatic camera framing everything, with a temporary sun if there are no lights) saved into your artifacts — open the returned path to see it. A few seconds at 800 px.",
+    description: "Look at the live scene: a quick Cycles CPU render (through the scene camera, or an automatic camera framing everything, with a temporary sun if there are no lights) saved into your artifacts and returned as a picture you see right away (its path too, to hand it over). A few seconds at 800 px.",
     schema: { max_size: z.number().optional().describe("longest side in px, default 800") },
     async handler(args, call) {
       try {
@@ -467,7 +467,14 @@ export default async function activate(ctx) {
         const saved = await pull(box, call, r.path, undefined, `Blender preview render (${r.width}×${r.height}, Cycles CPU) of the live scene`);
         box.lastUse = Date.now();
         persist();
-        return text(`preview: ${saved.rel} (${r.width}×${r.height}, ${r.elapsed_s} s)`);
+        const line = `preview: ${saved.rel} (${r.width}×${r.height}, ${r.elapsed_s} s)`;
+        // the picture itself, so the agent sees the scene in this step (cores
+        // that pass image blocks through); the path stays for handing it over
+        const abs = path.join(ctx.paths.workspaceArtifacts(call.workspace), saved.rel);
+        const size = fs.existsSync(abs) ? fs.statSync(abs).size : 0;
+        if (size > 0 && size <= 4 * 1024 * 1024)
+          return { content: [{ type: "image", data: fs.readFileSync(abs).toString("base64"), mimeType: "image/png" }, { type: "text", text: line }] };
+        return text(line);
       } catch (e) {
         return fail(e);
       }

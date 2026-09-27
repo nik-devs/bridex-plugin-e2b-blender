@@ -3,7 +3,7 @@
 # finish, writes artifacts with provenance and records spend — in-process
 # facilities a catalog "tool" plugin (out of process) does not get.
 name: e2b-blender
-version: 0.1.0
+version: 0.1.1
 kind: integration
 description: Blender for agents in an isolated cloud sandbox (E2B) — Python in a live scene, script files from skills, long renders that run in the background and wake the agent, previews, files in and out of artifacts.
 entry: index.mjs
