@@ -1,0 +1,47 @@
+# e2b-blender — Blender in an E2B sandbox for Bridex agents.
+# kind MUST stay "integration": the plugin wakes agents when background jobs
+# finish, writes artifacts with provenance and records spend — in-process
+# facilities a catalog "tool" plugin (out of process) does not get.
+name: e2b-blender
+version: 0.1.0
+kind: integration
+description: Blender for agents in an isolated cloud sandbox (E2B) — Python in a live scene, script files from skills, long renders that run in the background and wake the agent, previews, files in and out of artifacts.
+entry: index.mjs
+config_schema:
+  type: object
+  required: [api_key]
+  properties:
+    api_key:
+      type: string
+      title: E2B API key
+      secret: true
+      placeholder: ${E2B_API_KEY}
+      description: e2b.dev → API keys. ${E2B_API_KEY} reads it from the instance environment
+    template:
+      type: string
+      title: Sandbox template
+      default: bridex-blender
+      description: E2B template built from template/ in this plugin's repo
+    idle_s:
+      type: integer
+      title: Stop after idle, seconds
+      default: 300
+      minimum: 60
+    max_life_s:
+      type: integer
+      title: Longest sandbox life, seconds
+      default: 3600
+      minimum: 300
+      description: A sandbox is stopped after this even while busy (E2B Hobby allows 1 h, Pro 24 h)
+    sync_s:
+      type: integer
+      title: Wait inline up to, seconds
+      default: 150
+      minimum: 10
+      maximum: 170
+      description: Longer calls turn into background jobs that wake the agent
+    price_per_hour_usd:
+      type: number
+      title: Sandbox price per hour, USD
+      default: 0.33
+      description: 4 vCPU / 8 GB at E2B list prices — turns sandbox time into spend
