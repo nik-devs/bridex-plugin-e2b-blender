@@ -219,7 +219,7 @@ export default async function activate(ctx) {
   // -- background jobs: track, poll, wake -----------------------------------
 
   const fmt = (j) => {
-    const lines = [`job ${j.id} (${j.kind === "background" ? "blender -b" : "live scene"}): ${j.status} after ${j.elapsed_s} s`];
+    const lines = [`job ${j.id} (${j.kind === "background" ? "blender -b" : "live scene"}): ${j.status}${j.phase ? ` — ${j.phase}` : ""} after ${j.elapsed_s} s`];
     if (j.result) lines.push(`stdout:\n${String(j.result).slice(-TEXT_CAP)}`);
     if (j.error) lines.push(`error:\n${String(j.error).slice(-TEXT_CAP)}`);
     if (j.log_tail && j.status !== "running") lines.push(`log (${j.log_path}):\n${String(j.log_tail).slice(-TEXT_CAP)}`);
@@ -425,7 +425,7 @@ export default async function activate(ctx) {
         if (j.status === "running") {
           track(call, box, j, j.label ?? "python");
           return text(
-            `${uploaded}${args.background ? "background job started" : `still running after ${j.elapsed_s} s — detached`}: job ${j.id}. END your run now; you will be woken in this conversation when it finishes (blender_job to check or cancel).`,
+            `${uploaded}${args.background ? (j.phase ? `background job queued — ${j.phase} (code running there finishes first)` : "background job started") : `still running after ${j.elapsed_s} s — detached`}: job ${j.id}. END your run now; you will be woken in this conversation when it finishes (blender_job to check or cancel).`,
           );
         }
         return text(uploaded + fmt(j));
@@ -445,7 +445,7 @@ export default async function activate(ctx) {
         if (!box) return text("no sandbox for this task (it starts on the first blender_* call)");
         if (!args.job_id) {
           const all = await sbx(box, "GET", "/jobs");
-          return text(all.length ? all.map((j) => `${j.id} ${j.kind} ${j.status} ${j.elapsed_s}s — ${j.label}`).join("\n") : "no jobs yet");
+          return text(all.length ? all.map((j) => `${j.id} ${j.kind} ${j.status}${j.phase ? ` (${j.phase})` : ""} ${j.elapsed_s}s — ${j.label}`).join("\n") : "no jobs yet");
         }
         const j = args.cancel ? await sbx(box, "POST", `/jobs/${args.job_id}/cancel`, {}) : await sbx(box, "GET", `/jobs/${args.job_id}`);
         return text(j.error && j.status === "running" ? `${j.error}\n${fmt(j)}` : fmt(j));

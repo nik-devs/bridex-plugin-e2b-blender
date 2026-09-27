@@ -73,6 +73,8 @@ def new_job(kind, label):
 def view(job):
     end = job["ended"] or time.time()
     out = {k: job[k] for k in ("id", "kind", "label", "status", "result", "error")}
+    if job.get("phase"):
+        out["phase"] = job["phase"]
     out["elapsed_s"] = round(end - job["started"], 1)
     if job.get("log") and os.path.exists(job["log"]):
         with open(job["log"], errors="replace") as f:
@@ -108,7 +110,20 @@ def run_exec(job, code):
     job["ended"] = time.time()
 
 
-def run_spawn(job, argv_cmd, cwd):
+def run_spawn(job, argv_cmd, cwd, snapshot=None):
+    if snapshot:
+        try:
+            r = addon_call("execute_code", {"code": f"import bpy; bpy.ops.wm.save_as_mainfile(filepath={snapshot!r}, copy=True)"}, timeout=None)
+        except Exception as e:  # noqa: BLE001
+            r = {"status": "error", "message": f"{type(e).__name__}: {e}"}
+        if job["status"] == "cancelled":
+            return
+        if r.get("status") != "success":
+            job.update(status="failed", error=f"could not copy the live scene: {r.get('message')}", ended=time.time())
+            return
+        job.pop("phase", None)
+    if job["status"] == "cancelled":
+        return
     with open(job["log"], "w") as log:
         try:
             p = subprocess.Popen(argv_cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT)
@@ -235,12 +250,14 @@ class H(BaseHTTPRequestHandler):
                 return self._json(200, view(job))
             scene = body.get("scene", "current")
             blend = None
+            snapshot = None
             if scene == "current":
-                blend = os.path.join(jdir, "scene.blend")
-                r = addon_call("execute_code", {"code": f"import bpy; bpy.ops.wm.save_as_mainfile(filepath={blend!r}, copy=True)"}, timeout=120)
-                if r.get("status") != "success":
-                    job.update(status="failed", error=f"could not snapshot the live scene: {r.get('message')}", ended=time.time())
-                    return self._json(200, view(job))
+                # the copy is taken on Blender's main thread, i.e. once live
+                # code there finishes — in the job's own thread, so this call
+                # returns now and a long live render delays the job instead
+                # of failing it
+                blend = snapshot = os.path.join(jdir, "scene.blend")
+                job["phase"] = "waiting for the live scene to copy it"
             elif scene and scene != "empty":
                 blend = scene
             # the script sees the same sys.argv as in the live scene — [script, *argv] —
@@ -255,13 +272,18 @@ class H(BaseHTTPRequestHandler):
                 )
             cmd = [BLENDER, "-b"] + ([blend] if blend else ["--factory-startup"]) + [
                 "--python-exit-code", "1", "--python", boot]
-            threading.Thread(target=run_spawn, args=(job, cmd, body.get("cwd") or WORK), daemon=True).start()
+            threading.Thread(target=run_spawn, args=(job, cmd, body.get("cwd") or WORK, snapshot), daemon=True).start()
             return self._json(200, wait_for(job, body.get("sync_s", 0)))
         if u.path.startswith("/jobs/") and u.path.endswith("/cancel"):
             job = jobs.get(u.path.split("/")[2])
             if not job:
                 return self._json(404, {"error": "unknown job"})
             if job["status"] != "running":
+                return self._json(200, view(job))
+            if job["kind"] == "background" and not job.get("proc"):
+                # still waiting to copy the live scene: it never starts
+                job["status"] = "cancelled"
+                job["ended"] = time.time()
                 return self._json(200, view(job))
             if job["kind"] == "background" and job.get("proc"):
                 job["status"] = "cancelled"

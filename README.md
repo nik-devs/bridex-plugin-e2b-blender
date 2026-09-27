@@ -45,3 +45,6 @@ Build in E2B's cloud, no local Docker:
 ```sh
 cd template && E2B_API_KEY=… python build.py bridex-blender
 ```
+
+CI does the same on every push that touches `template/` (`.github/workflows/template.yml`,
+repo secret `E2B_API_KEY`; also runnable by hand from the Actions tab).
