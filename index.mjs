@@ -338,6 +338,15 @@ export default async function activate(ctx) {
   function settle(trackId, p, j, extra = "") {
     pending.delete(trackId);
     const ok = j && j.status === "done";
+    // the agent is woken to collect the result: the idle clock starts NOW, not
+    // at its last call before the render — a 12-minute render was followed by
+    // the watcher stopping the sandbox 20 s later, /work and the frames gone
+    const box = Object.values(boxes).find((b) => b.id === p.boxId);
+    if (box) {
+      box.lastUse = Date.now();
+      persist();
+      e2b("POST", `/sandboxes/${box.id}/timeout`, { timeout: idleS }).catch((e) => log.warn(`extend ${box.id} after job: ${e.message}`));
+    }
     ctx.jobs.settle(trackId, ok ? { status: "succeeded", result: { elapsed_s: j.elapsed_s } } : { status: "failed", error: j?.error ?? extra });
     ctx.wakeAgent({
       workspace: p.workspace,
@@ -347,7 +356,7 @@ export default async function activate(ctx) {
       prompt:
         `Blender job ${p.jobId} (${p.label}) ${ok ? "finished" : "FAILED"}${p.taskId ? ` — task ${p.taskId}` : ""}.\n` +
         (j ? fmt(j) : extra) +
-        `\n${ok ? "Pull the files you need into artifacts with blender_pull, then continue." : "Fix the script and run it again, or report the blocker."}`,
+        `\n${ok ? `Pull the files you need into artifacts with blender_pull, then continue — the sandbox stays up ${Math.round(idleS / 60)} min from now without calls.` : "Fix the script and run it again, or report the blocker."}`,
     });
   }
 
