@@ -210,12 +210,19 @@ export default async function activate(ctx) {
     }
   }
 
+  // why a task's sandbox went away, so the next one can say so: a fresh box
+  // after an idle reset looked like the old one and the agent worked on an
+  // empty scene as if its setup were still there
+  const ended = new Map();
+  const notices = new Map();
+
   function forget(key, reason) {
     const box = boxes[key];
     if (!box) return;
     recordSpend(box, reason);
     delete boxes[key];
     persist();
+    if (reason !== "blender_stop") ended.set(key, { reason, at: Date.now() });
   }
 
   async function boxFor(call) {
@@ -256,6 +263,12 @@ export default async function activate(ctx) {
     boxes[key] = box;
     persist();
     log.info(`sandbox ${box.id} started for @${call.agent} in ${Date.now() - t0} ms`);
+    const prev = ended.get(key);
+    if (prev) {
+      ended.delete(key);
+      const mins = Math.round((Date.now() - prev.at) / 60_000);
+      notices.set(key, `[A NEW sandbox was started: the previous one stopped${mins >= 1 ? ` ${mins} min ago` : ""} (${prev.reason}). The scene and /work are EMPTY — redo the setup and push the files again before going on.]`);
+    }
     return box;
   }
 
@@ -335,7 +348,7 @@ export default async function activate(ctx) {
     return trackId;
   }
 
-  function settle(trackId, p, j, extra = "") {
+  function settle(trackId, p, j, extra = "", { wake = true } = {}) {
     pending.delete(trackId);
     const ok = j && j.status === "done";
     // the agent is woken to collect the result: the idle clock starts NOW, not
@@ -348,6 +361,8 @@ export default async function activate(ctx) {
       e2b("POST", `/sandboxes/${box.id}/timeout`, { timeout: idleS }).catch((e) => log.warn(`extend ${box.id} after job: ${e.message}`));
     }
     ctx.jobs.settle(trackId, ok ? { status: "succeeded", result: { elapsed_s: j.elapsed_s } } : { status: "failed", error: j?.error ?? extra });
+    // the agent already read the result itself (blender_job) — a wake would only repeat it
+    if (!wake) return;
     ctx.wakeAgent({
       workspace: p.workspace,
       agent: p.agent,
@@ -460,6 +475,21 @@ export default async function activate(ctx) {
   // -- tools ----------------------------------------------------------------
 
   const text = (t) => ({ content: [{ type: "text", text: t }] });
+  // every tool result of a call that had to start a NEW sandbox opens with why
+  const register = (def) =>
+    ctx.registerTool({
+      ...def,
+      async handler(args, call) {
+        const r = await def.handler(args, call);
+        const key = keyOf(call);
+        const notice = notices.get(key);
+        if (notice && r && Array.isArray(r.content)) {
+          notices.delete(key);
+          r.content = [{ type: "text", text: notice }, ...r.content];
+        }
+        return r;
+      },
+    });
   const fail = (e) => text(`error: ${e.message ?? e}`);
   const parseList = (v) => {
     if (Array.isArray(v)) return v.map(String);
@@ -469,7 +499,7 @@ export default async function activate(ctx) {
     return [s];
   };
 
-  ctx.registerTool({
+  register({
     name: "blender_python",
     description:
       `Run Python in Blender (bpy) in your own cloud sandbox — the scene lives across calls for this task; the first call starts the sandbox (~2 s). Give inline \`code\`, or a \`script\` file from your workspace (a skill's <skill>/scripts/x.py, or artifacts/...) with \`argv\` — the script's folder is uploaded next to it and it runs as __main__ with sys.argv = [script, *argv]. print() output and the full traceback come back.\n` +
@@ -538,7 +568,7 @@ export default async function activate(ctx) {
     },
   });
 
-  ctx.registerTool({
+  register({
     name: "blender_job",
     description: "Background Blender jobs of this task's sandbox: status of one (job_id), cancel it (cancel=true — only background `blender -b` jobs can be cancelled; code in the live scene cannot be interrupted, stop the sandbox instead), or list all without job_id. Normally the wakeup finds you first — do not poll in a loop.",
     schema: { job_id: z.string().optional(), cancel: z.boolean().optional() },
@@ -551,6 +581,8 @@ export default async function activate(ctx) {
           return text(all.length ? all.map((j) => `${j.id} ${j.kind} ${j.status}${j.phase ? ` (${j.phase})` : ""} ${j.elapsed_s}s — ${j.label}`).join("\n") : "no jobs yet");
         }
         const j = args.cancel ? await sbx(box, "POST", `/jobs/${args.job_id}/cancel`, {}) : await sbx(box, "GET", `/jobs/${args.job_id}`);
+        if (j.status && j.status !== "running")
+          for (const [trackId, p] of [...pending]) if (p.boxId === box.id && p.jobId === args.job_id) settle(trackId, p, j, "", { wake: false });
         return text(j.error && j.status === "running" ? `${j.error}\n${fmt(j)}` : fmt(j));
       } catch (e) {
         return fail(e);
@@ -558,7 +590,7 @@ export default async function activate(ctx) {
     },
   });
 
-  ctx.registerTool({
+  register({
     name: "blender_preview",
     description: "Look at the live scene: a quick Cycles CPU render (through the scene camera, or an automatic camera framing everything, with a temporary sun if there are no lights) saved into your artifacts and returned as a picture you see right away (its path too, to hand it over). A few seconds at 800 px.",
     schema: { max_size: z.number().optional().describe("longest side in px, default 800") },
@@ -584,7 +616,7 @@ export default async function activate(ctx) {
     },
   });
 
-  ctx.registerTool({
+  register({
     name: "blender_push",
     description: "Copy files from your workspace (artifacts/... or a skill's files) into the sandbox, e.g. textures, references, a .blend to open. They land in `to` (default /work/in).",
     schema: {
@@ -607,7 +639,7 @@ export default async function activate(ctx) {
     },
   });
 
-  ctx.registerTool({
+  register({
     name: "blender_pull",
     description: "Bring files out of the sandbox into this task's artifacts (renders, .glb/.fbx/.blend exports) — with provenance, visible in the dashboard. Pass exact sandbox paths, or a folder to take everything in it (e.g. /work/out). Call it before the sandbox stops: its files are gone after.",
     schema: {
@@ -641,7 +673,7 @@ export default async function activate(ctx) {
     },
   });
 
-  ctx.registerTool({
+  register({
     name: "blender_tool",
     description:
       "Call one tool of the MCP for Blender server in your sandbox by name: get_scene_info, get_object_info {object_name}, bpy_api_lookup {query}, describe_node_type {bl_idname}, search_polyhaven_assets / download_polyhaven_asset / set_texture (free Poly Haven HDRIs, textures, models), search_sketchfab_models / download_sketchfab_model, and more. Python work goes through blender_python.",
@@ -674,7 +706,7 @@ export default async function activate(ctx) {
     },
   });
 
-  ctx.registerTool({
+  register({
     name: "blender_stop",
     description: "Stop this task's Blender sandbox now (it also stops by itself after idle time). Pass save_blend to keep the scene: it is saved and pulled into artifacts first. Running background jobs are lost.",
     schema: { save_blend: z.string().optional().describe("file name for the saved scene, e.g. tower.blend") },
