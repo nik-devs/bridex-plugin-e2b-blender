@@ -44,7 +44,8 @@ export default async function activate(ctx) {
   // the plugin's own build, named by the hash of its files
   const custom = cfg.template && cfg.template !== "bridex-blender" ? String(cfg.template) : null;
   const template = custom ?? templateName();
-  const idleS = Number(cfg.idle_s) > 0 ? Number(cfg.idle_s) : 300;
+  // 20 min: a strong model thinks 10–15 min between calls, and at 5 the live scene died between steps
+  const idleS = Number(cfg.idle_s) > 0 ? Number(cfg.idle_s) : 1200;
   const maxLifeS = Number(cfg.max_life_s) > 0 ? Number(cfg.max_life_s) : 3600;
   const syncS = Math.min(170, Number(cfg.sync_s) > 0 ? Number(cfg.sync_s) : 150);
   const pricePerHour = Number(cfg.price_per_hour_usd ?? 0.33) || 0;
@@ -504,7 +505,8 @@ export default async function activate(ctx) {
     description:
       `Run Python in Blender (bpy) in your own cloud sandbox — the scene lives across calls for this task; the first call starts the sandbox (~2 s). Give inline \`code\`, or a \`script\` file from your workspace (a skill's <skill>/scripts/x.py, or artifacts/...) with \`argv\` — the script's folder is uploaded next to it and it runs as __main__ with sys.argv = [script, *argv]. print() output and the full traceback come back.\n` +
       `Timing — you never have to guess whether something fits: in the live scene the call waits up to ${syncS} s; if the code is still running then (a big render, a bake), it continues as a background job and you get its id — END your run, you will be woken with the result. For work you already know is long (renders from several angles, exports of many files, simulations), pass background=true: a separate Blender process runs on a copy of the current scene (scene="current", or "empty", or a .blend path in the sandbox) while the live scene stays free; it wakes you when done. The copy is taken when the live scene is free — if live code is still running, the background job starts after it (scene="empty" or a .blend starts at once). Every result reports elapsed seconds — note typical durations for next time.\n` +
-      `Write outputs under /work (e.g. /work/out/…), then blender_pull them into artifacts. Only the scene persists between calls, not Python variables.`,
+      `Write outputs under /work (e.g. /work/out/…), then blender_pull them into artifacts. Only the scene persists between calls, not Python variables.\n` +
+      `Look as you go: after each meaningful step (the blockout, proportions, a new part, UVs, the rig) take blender_preview from two or three angles and hold it against the reference before the next step — a mistake seen at the blockout costs one call, the same one found at the art gate costs a round.`,
     schema: {
       code: z.string().optional().describe("inline Python (bpy is imported for you in the live scene)"),
       script: z.string().optional().describe("a .py file in your workspace: <skill>/scripts/file.py or artifacts/..."),
@@ -592,7 +594,7 @@ export default async function activate(ctx) {
 
   register({
     name: "blender_preview",
-    description: "Look at the live scene: a quick Cycles CPU render (through the scene camera, or an automatic camera framing everything, with a temporary sun if there are no lights) saved into your artifacts and returned as a picture you see right away (its path too, to hand it over). A few seconds at 800 px.",
+    description: "Look at the live scene: a quick Cycles CPU render (through the scene camera, or an automatic camera framing everything, with a temporary sun if there are no lights) saved into your artifacts and returned as a picture you see right away (its path too, to hand it over). A few seconds at 800 px. Use it after every meaningful step, from several angles — move the camera with blender_python between previews (front three-quarter, side, back, top) — not only before handing over.",
     schema: { max_size: z.number().optional().describe("longest side in px, default 800") },
     async handler(args, call) {
       try {
