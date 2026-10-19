@@ -1,5 +1,7 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Template } from "e2b";
 import { blenderTemplate, templateName } from "./template/template.mjs";
 
@@ -21,7 +23,9 @@ import { blenderTemplate, templateName } from "./template/template.mjs";
  * for Blender addon, the MCP server on :8000/mcp, and a small job/file API on
  * :8001. Ports are not public (allow_public_traffic=false) — every request
  * carries the sandbox's traffic token. No keys ever enter the sandbox: files
- * go in and out through the plugin.
+ * go in and out through the plugin. The plugin's own code for the live scene
+ * (preview cameras and shading, game-size pixels, the reference comparison) is
+ * in sandbox/ and goes in with each call, so changing it rebuilds no template.
  *
  * Long work never hits a wall: python in the live scene waits inline up to
  * sync_s and then continues as a background job; blender_python with
@@ -57,6 +61,24 @@ export default async function activate(ctx) {
     ctx.needsConfig("set the E2B API key (plugins.e2b-blender.config.api_key, or ${E2B_API_KEY} in the environment)");
     return;
   }
+
+  // Python the plugin runs in the live scene that is not part of the template (sandbox/ in this
+  // repo — the template's file hash names it, and a change there rebuilds it on every instance):
+  // sent to POST /exec with its arguments in front, sandbox/lib.py's helpers next
+  const sandboxDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "sandbox");
+  const SANDBOX_PY = Object.fromEntries(
+    ["lib", "preview", "game_pixels", "compare_reference"].map((n) => [n, fs.readFileSync(path.join(sandboxDir, `${n}.py`), "utf8")]),
+  );
+  const py = (name, args) => `import json\nARGS = json.loads(${JSON.stringify(JSON.stringify(args))})\n${SANDBOX_PY.lib}\n${SANDBOX_PY[name]}`;
+  /** The "BX {json}" line that code prints with what it did. */
+  const bxOf = (j) => {
+    const m = /^BX (\{.*\})\s*$/m.exec(String(j?.result ?? ""));
+    try {
+      return m ? JSON.parse(m[1]) : null;
+    } catch {
+      return null;
+    }
+  };
 
   // -- durable state: live sandboxes + background jobs ----------------------
 
@@ -718,8 +740,8 @@ export default async function activate(ctx) {
         const box = boxes[keyOf(call)];
         if (!box) return text("no sandbox for this task (it starts on the first blender_* call)");
         if (!args.job_id) {
-          // the plugin's own short calls (preview cameras, the autosave) are not the agent's jobs
-          const all = (await sbx(box, "GET", "/jobs")).filter((j) => !/^(preview camera|autosave)/.test(String(j.label ?? "")));
+          // the plugin's own short calls (preview cameras and comparisons, the autosave) are not the agent's jobs
+          const all = (await sbx(box, "GET", "/jobs")).filter((j) => !/^(preview (camera|pixels|compare)|autosave)/.test(String(j.label ?? "")));
           return text(all.length ? all.map((j) => `${j.id} ${j.kind} ${j.status}${j.phase ? ` (${j.phase})` : ""} ${j.elapsed_s}s — ${j.label}`).join("\n") : "no jobs yet");
         }
         const j = args.cancel ? await sbx(box, "POST", `/jobs/${args.job_id}/cancel`, {}) : await sbx(box, "GET", `/jobs/${args.job_id}`);
@@ -732,126 +754,292 @@ export default async function activate(ctx) {
     },
   });
 
-  // where a preview camera looks FROM (Blender's front view looks from -Y); the side and top views are orthographic
-  const VIEWS = {
-    front: [0, -1, 0],
-    back: [0, 1, 0],
-    left: [-1, 0, 0],
-    right: [1, 0, 0],
-    top: [0, 0, 1],
-    three_quarter: [1, -1.2, 0.8],
-  };
+  // -- blender_preview: views, shading, game size, the reference sheet -----
+  // the views and where they look from are in sandbox/lib.py (BX_VIEWS); these five are orthographic
+  const VIEW_NAMES = ["camera", "front", "back", "left", "right", "top", "three_quarter", "custom"];
   const ORTHO = new Set(["front", "back", "left", "right", "top"]);
-  /**
-   * A temporary camera framing what is visible (or the named objects/collections)
-   * from one side. Fitted to the frame in both directions: the template's own
-   * automatic camera fits a sphere to the wide side of a 16:9 frame, so a tall
-   * character lost its head and feet.
-   */
-  const viewCameraCode = (view, names) => `import bpy, math, mathutils
-sc = bpy.context.scene
-names = set(${JSON.stringify(names)})
-view = ${JSON.stringify(view)}
-if view == "camera" and sc.camera:
-    print("scene camera")
-else:
-    if view == "camera":
-        view = "three_quarter"
-    def wanted(o):
-        return not names or o.name in names or any(c.name in names for c in o.users_collection)
-    obs = [o for o in sc.objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'} and o.visible_get() and wanted(o)]
-    if not obs:
-        raise RuntimeError("nothing visible to frame" + (": no visible object or collection named " + ", ".join(sorted(names)) if names else " in the scene"))
-    pts = [o.matrix_world @ mathutils.Vector(c) for o in obs for c in o.bound_box]
-    lo = mathutils.Vector([min(p[i] for p in pts) for i in range(3)])
-    hi = mathutils.Vector([max(p[i] for p in pts) for i in range(3)])
-    center = (lo + hi) / 2
-    radius = max((hi - lo).length / 2, 1e-4)
-    dirs = ${JSON.stringify(VIEWS)}
-    d = mathutils.Vector(dirs[view]).normalized()
-    data = bpy.data.cameras.new("bx_view_cam")
-    cam = bpy.data.objects.new("bx_view_cam", data)
-    sc.collection.objects.link(cam)
-    cam.location = center + d * radius * 4
-    cam.rotation_euler = (0.0, 0.0, 0.0) if view == "top" else (-d).to_track_quat('-Z', 'Y').to_euler()
-    rot = cam.rotation_euler.to_matrix()
-    right, up, back = rot @ mathutils.Vector((1, 0, 0)), rot @ mathutils.Vector((0, 1, 0)), rot @ mathutils.Vector((0, 0, 1))
-    rel = [p - center for p in pts]
-    r = sc.render
-    aspect = (r.resolution_x or 1920) / (r.resolution_y or 1080)
-    if view in ${JSON.stringify([...ORTHO])}:
-        w = max(abs(p.dot(right)) for p in rel) * 2
-        h = max(abs(p.dot(up)) for p in rel) * 2
-        data.type = 'ORTHO'
-        data.ortho_scale = max(w, h * aspect) * 1.08 if aspect >= 1 else max(h, w / aspect) * 1.08
-        dist = radius * 4
-    else:
-        t = math.tan(data.angle / 2)
-        tan_h, tan_v = (t, t / aspect) if aspect >= 1 else (t * aspect, t)
-        dist = max(max(p.dot(back) + abs(p.dot(right)) * 1.06 / tan_h, p.dot(back) + abs(p.dot(up)) * 1.06 / tan_v) for p in rel)
-    cam.location = center + back * dist
-    data.clip_start = max(min(0.1, (dist - radius) * 0.5), 1e-4)
-    data.clip_end = (dist + radius) * 2
-    bpy.app.driver_namespace["bx_view"] = (sc.camera.name if sc.camera else "", cam.name)
-    sc.camera = cam
-    print("view camera")`;
-  const restoreCameraCode = `import bpy
-sc = bpy.context.scene
-prev, made = bpy.app.driver_namespace.pop("bx_view", ("", ""))
-if made:
-    sc.camera = bpy.data.objects.get(prev) if prev else None
-    cam = bpy.data.objects.get(made)
-    if cam:
-        data = cam.data
-        bpy.data.objects.remove(cam, do_unlink=True)
-        bpy.data.cameras.remove(data)
-print("restored")`;
+  const SHADINGS = ["material", "clay", "silhouette"];
+  const REF_EXAMPLE = '{image: "artifacts/refs/sheet.png", crop: [0, 0, 512, 1024], view: "front", height_m: 1.8}';
+  const firstLine = (s) => String(s ?? "").split("\n")[0];
+  const nums = (v) => (Array.isArray(v) ? v : String(v ?? "").replace(/[[\]\s]/g, "").split(",").filter(Boolean)).map(Number);
+  const signed = (v, d = 1) => {
+    if (v == null || !Number.isFinite(v)) return "?";
+    const r = Number(v.toFixed(d));
+    return `${r > 0 ? "+" : r < 0 ? "-" : ""}${Math.abs(r).toFixed(d)}`;
+  };
+  const mm = (m) => `${Number((m * 1000).toPrecision(3))} mm`;
+  /** A pulled picture as an image block, so the agent sees it in this step (cores that pass image blocks through). */
+  const picture = (call, rel) => {
+    const abs = path.join(ctx.paths.workspaceArtifacts(call.workspace), rel.replace(/^artifacts\//, ""));
+    const size = fs.existsSync(abs) ? fs.statSync(abs).size : 0;
+    return size > 0 && size <= 4 * 1024 * 1024 ? { type: "image", data: fs.readFileSync(abs).toString("base64"), mimeType: "image/png" } : null;
+  };
+
+  /** The reference argument, checked before anything runs in the sandbox: a wrong one fails at once and says what to give. */
+  function referenceOf(raw) {
+    let ref = raw;
+    if (typeof ref === "string") {
+      try {
+        ref = JSON.parse(ref);
+      } catch {
+        ref = null;
+      }
+    }
+    if (!ref || typeof ref !== "object" || Array.isArray(ref)) throw new Error(`reference is an object, e.g. ${REF_EXAMPLE}`);
+    const has = (k) => ref[k] !== undefined && ref[k] !== null && ref[k] !== "";
+    const list = (v, n, what) => {
+      const a = nums(v);
+      if (a.length !== n || a.some((x) => !Number.isFinite(x))) throw new Error(`${what} is ${n} numbers`);
+      return a;
+    };
+    if (!has("image")) throw new Error(`reference.image is required — the sheet, e.g. ${REF_EXAMPLE}`);
+    const view = has("view") ? String(ref.view) : "front";
+    if (!ORTHO.has(view)) throw new Error(`reference.view is the orthographic view the crop shows: front, back, left, right or top (got ${JSON.stringify(ref.view)})`);
+    if (has("m_per_px") === has("height_m"))
+      throw new Error("reference needs exactly one scale: m_per_px (metres per sheet pixel) or height_m (the object's real height — the figure's height on the sheet then sets the scale)");
+    const scale = has("m_per_px") ? { m_per_px: Number(ref.m_per_px) } : { height_m: Number(ref.height_m) };
+    const sv = Object.values(scale)[0];
+    if (!Number.isFinite(sv) || sv <= 0) throw new Error(`reference.${Object.keys(scale)[0]} is a positive number of metres`);
+    if (scale.height_m && view === "top") throw new Error("reference.height_m sets the scale from the figure's height, which a top view does not show — give m_per_px for the top view");
+    const crop = has("crop") ? list(ref.crop, 4, "reference.crop [x0, y0, x1, y1]") : null;
+    if (crop && !(crop[0] >= 0 && crop[1] >= 0 && crop[2] > crop[0] && crop[3] > crop[1]))
+      throw new Error("reference.crop is [x0, y0, x1, y1] px in the image, its left-top and right-bottom corners: x1 > x0 ≥ 0, y1 > y0 ≥ 0");
+    const origin = has("origin") ? list(ref.origin, 2, "reference.origin [col, row]") : null;
+    const tolerance = has("tolerance") ? Number(ref.tolerance) : 40;
+    if (!(tolerance >= 0 && tolerance <= 255)) throw new Error("reference.tolerance is 0–255");
+    let marks = has("landmarks") ? ref.landmarks : [];
+    if (typeof marks === "string") marks = JSON.parse(marks);
+    if (!Array.isArray(marks) || marks.length > 16) throw new Error("reference.landmarks is a list of at most 16 {name, object, point?, at}");
+    const landmarks = marks.map((l, i) => {
+      if (!l || typeof l !== "object" || !l.object || l.at == null) throw new Error(`reference.landmarks[${i}] needs object (an object's name) and at ([col, row] px in the crop)`);
+      return {
+        name: String(l.name ?? l.object),
+        object: String(l.object),
+        ...(l.point != null ? { point: list(l.point, 3, `reference.landmarks[${i}].point [x, y, z]`) } : {}),
+        at: list(l.at, 2, `reference.landmarks[${i}].at [col, row]`),
+      };
+    });
+    return { image: String(ref.image), mask: has("mask") ? String(ref.mask) : null, view, crop, origin, tolerance, landmarks, ...scale };
+  }
+
+  /** A sheet or mask in the workspace, found before anything renders: a wrong path costs no sandbox time. */
+  function refFile(call, p) {
+    const abs = workspaceFile(call, p);
+    const size = fs.statSync(abs).size;
+    if (size > 50 * 1024 ** 2) throw new Error(`${p} is ${Math.round(size / 1024 ** 2)} MB — give a smaller copy of the sheet (up to 50 MB)`);
+    return abs;
+  }
+
+  /** A workspace file into the sandbox's hidden /work/.bridex/ref/, sent again only when it changed (size:mtime, like a script's folder). */
+  async function sendRef(box, abs) {
+    const st = fs.statSync(abs);
+    const remote = `/work/.bridex/ref/${crypto.createHash("sha1").update(abs).digest("hex").slice(0, 8)}-${path.basename(abs)}`;
+    const stamp = `${st.size}:${Math.round(st.mtimeMs)}`;
+    box.sent ??= {};
+    if (box.sent[remote] !== stamp) {
+      await push(box, abs, remote);
+      box.sent[remote] = stamp;
+    }
+    return remote;
+  }
+
+  function compareLines(res, ref, rel) {
+    const side = res.view !== "top";
+    const L = [`reference ${res.view}: ${rel} — grey both, red sheet only, blue model only${res.landmarks?.length ? "; crosses: yellow sheet, blue model landmark" : ""}`];
+    L.push(
+      `sheet ${ref.image}${ref.crop ? ` crop [${res.crop.join(", ")}]` : ""}: ${res.size.join("×")} px, figure by ${res.mask}; ` +
+        `1 px = ${(res.m_per_px * 100).toFixed(2)} cm (${res.scale_from}); world origin at [${res.origin.join(", ")}] (${res.origin_from})`,
+    );
+    L.push(`IoU ${res.iou.toFixed(3)} · sheet only ${res.sheet_only_pct.toFixed(1)} % · model only ${res.model_only_pct.toFixed(1)} % (of the sheet figure's area)`);
+    if (res.model_cm) {
+      const dh = res.model_cm.height - res.sheet_cm.height;
+      const dw = res.model_cm.width - res.sheet_cm.width;
+      L.push(
+        `${side ? "height" : "depth (image up–down)"}: model ${res.model_cm.height.toFixed(1)} cm, sheet ${res.sheet_cm.height.toFixed(1)} cm → ${signed(dh)} cm (${signed((100 * dh) / res.sheet_cm.height)} %); ` +
+          `top ${signed(res.top_cm)}, bottom ${signed(res.bottom_cm)} cm (up +)`,
+      );
+      L.push(`width: model ${res.model_cm.width.toFixed(1)} cm, sheet ${res.sheet_cm.width.toFixed(1)} cm → ${signed(dw)} cm; centre ${signed(res.centre_cm)} cm (right +)`);
+      L.push(`width by band, top to bottom (model − sheet, cm): ${res.bands_cm.map((b) => (b == null ? "·" : signed(b))).join(" ")}`);
+    }
+    if (res.landmarks?.length)
+      L.push(`landmarks (model − sheet, cm, right / up +): ${res.landmarks.map((m) => (m.error ? `${m.name}: ${m.error}` : `${m.name} ${signed(m.dx_cm)} / ${signed(m.dy_cm)}`)).join(" · ")}`);
+    L.push(
+      `compared ${res.object_count} object(s): ${res.objects.join(", ")}${res.object_count > res.objects.length ? ", …" : ""} — ` +
+        `silhouette ${res.render_px.join("×")} px (${res.supersample}×${res.supersample} samples per sheet px), ${res.elapsed_s} s`,
+    );
+    for (const w of res.warnings ?? []) L.push(`note: ${w}`);
+    return L;
+  }
+
+  /** The model against one orthographic view of the reference sheet: one /exec renders, measures and restores. */
+  async function compare(box, call, ref, files, names, viewPx) {
+    const image = await sendRef(box, files.image);
+    const mask = files.mask ? await sendRef(box, files.mask) : null;
+    const out = `/work/previews/compare-${ref.view}-${Date.now()}.png`;
+    const j = await sbx(box, "POST", "/exec", {
+      code: py("compare_reference", { ...ref, image, mask, objects: names, out, view_px: viewPx }),
+      sync_s: syncS,
+      label: `preview compare: ${ref.view}`,
+    });
+    const head = `reference ${ref.view}`;
+    if (j.status === "running") return { lines: [`${head}: still running after ${j.elapsed_s} s — the live scene is busy (a call is still running there); compare after it finishes`] };
+    if (j.status !== "done") {
+      const err = String(j.error ?? "the comparison failed");
+      // a check of the arguments says what to change in one line; anything else keeps its traceback
+      return { lines: [`${head}: error: ${/^(ValueError|RuntimeError): /.test(err) ? firstLine(err) : err.slice(-1500)}`] };
+    }
+    const res = bxOf(j);
+    if (!res) return { lines: [`${head}: error: the comparison gave no result:\n${String(j.result ?? "").slice(-600)}`] };
+    const saved = await pull(
+      box,
+      call,
+      out,
+      undefined,
+      `Blender: the model against the reference ${ref.image} (${ref.view}), silhouettes registered in world units — grey both, red sheet only, blue model only`,
+      path.posix.join(`blender/${call.taskId ?? "chat"}`, "previews", path.posix.basename(out)),
+    );
+    return { rel: saved.rel, lines: compareLines(res, ref, saved.rel) };
+  }
 
   register({
     name: "blender_preview",
     description:
       "Look at the live scene: a quick Cycles CPU render saved into your artifacts and returned as a picture you see right away (its path too, to hand it over). " +
-      'views: "camera" — the scene camera, or without one a three-quarter view framing everything — and front / back / left / right / top (orthographic: proportions and silhouettes against an ortho sheet) / three_quarter; several in one call. ' +
-      "objects frames just those objects or collections (the rest stays in the picture). A few seconds per view at 800 px, with a temporary sun when the scene has no lights; the scene's own camera stays as it was. " +
+      'views: "camera" — the scene camera, or without one a three-quarter view framing everything — front / back / left / right / top (orthographic: proportions and silhouettes; those in one call share one scale, given in mm per px) / three_quarter; azimuth + elevation (+ lens) add "custom", a perspective view from any angle. ' +
+      "objects frames just those objects or collections (the rest stays in the picture). shading: clay (plain grey: form) or silhouette (black on white: outline). game_px renders that small and enlarges it with hard pixels: how the asset reads at game size. A few seconds per view at 800 px; the scene's camera, materials and world stay as they were. " +
+      `reference measures the model against one orthographic view of a reference sheet in world units, nothing re-centred or re-scaled: reference: ${REF_EXAMPLE} → a diff picture with IoU and cm for height, centre offset and width by band. The crop is that one view on plain background (labels, rulers and ground lines count as figure). ` +
       "Use it after every meaningful step from two or three angles (e.g. three_quarter, front, right), not only before handing over.",
     schema: {
-      views: z.array(z.enum(["camera", "front", "back", "left", "right", "top", "three_quarter"])).optional().describe('default ["camera"]; up to 6'),
-      objects: z.array(z.string()).optional().describe("object or collection names to frame; default everything visible"),
-      max_size: z.number().optional().describe("longest side in px, default 800"),
+      views: z.array(z.enum(VIEW_NAMES)).optional().describe('default ["camera"]; with azimuth/elevation alone just "custom", with reference alone none. Up to 6 plus custom'),
+      azimuth: z.number().optional().describe('degrees around the subject for the "custom" view: 0 front (camera at -Y), 90 right (+X), 180 back, -90 left'),
+      elevation: z.number().optional().describe("custom view: degrees above the horizon, -90…90 (negative: from below); default 0"),
+      lens: z.number().optional().describe("custom view focal length in mm, default 50"),
+      shading: z.enum(SHADINGS).optional().describe("material (default), clay or silhouette"),
+      game_px: z.number().optional().describe("render with this longest side, then enlarge with hard pixels to about max_size: e.g. 64 for an icon, 256 for a sprite"),
+      objects: z
+        .array(z.string())
+        .optional()
+        .describe("object or collection names (children and nested collections included): views frame just these; with reference only these render — name the model when the scene holds helpers (a floor, a reference plane). Default everything visible"),
+      max_size: z.number().optional().describe("longest side in px, default 800 (with game_px: the size it is enlarged to)"),
+      reference: z
+        .object({
+          image: z.string().describe("the sheet: artifacts/... or a file of your task's checkout"),
+          crop: z.array(z.number()).optional().describe("[x0, y0, x1, y1] px in the image: the one view to compare (left-top, right-bottom); default the whole image"),
+          view: z.enum(["front", "back", "left", "right", "top"]).optional().describe("the view the crop shows, default front"),
+          m_per_px: z.number().optional().describe("metres per sheet pixel — or height_m"),
+          height_m: z.number().optional().describe("the object's real height: the figure's height on the sheet sets the scale (not for top)"),
+          origin: z
+            .array(z.number())
+            .optional()
+            .describe("[col, row] px in the crop where the world origin is: the vertical axis column and the ground line (top: the x = 0 column, y = 0 row). Default the figure's box centre column and bottom — give it for side views, which are rarely centred"),
+          mask: z.string().optional().describe("white-on-black image of the figure (the image's or the crop's size), instead of finding it automatically"),
+          tolerance: z.number().optional().describe("sheets without transparency: a pixel is figure when its R+G+B differ from the corner colour by more than this; 0–255, default 40"),
+          landmarks: z
+            .array(
+              z.object({
+                name: z.string(),
+                object: z.string().describe("the object the point belongs to"),
+                point: z.array(z.number()).optional().describe("[x, y, z] in the object's local space, default its origin"),
+                at: z.array(z.number()).describe("[col, row] px in the crop where the sheet has it"),
+              }),
+            )
+            .optional()
+            .describe("up to 16 points to check, e.g. the chin, a hand, the top of the head"),
+        })
+        .optional()
+        .describe(`compare with one orthographic view of a reference sheet in world units, e.g. ${REF_EXAMPLE}`),
     },
     async handler(args, call) {
       try {
+        // everything about the arguments is checked before the sandbox starts
+        const ref = args.reference != null && args.reference !== "" ? referenceOf(args.reference) : null;
+        const refFiles = ref ? { image: refFile(call, ref.image), mask: ref.mask ? refFile(call, ref.mask) : null } : null;
+        const shading = args.shading ?? "material";
+        if (!SHADINGS.includes(shading)) return text(`error: shading is one of ${SHADINGS.join(", ")}`);
+        let views = [...new Set(parseList(args.views))];
+        const unknown = views.filter((v) => !VIEW_NAMES.includes(v));
+        if (unknown.length) return text(`error: unknown view ${unknown.join(", ")} — views are ${VIEW_NAMES.join(", ")}`);
+        const angled = args.azimuth != null || args.elevation != null;
+        if (views.includes("custom") && !angled) return text("error: the custom view looks from azimuth / elevation — give them, e.g. azimuth: 30, elevation: 15");
+        if (args.lens != null && !angled) return text("error: lens is for the custom view — give azimuth (and elevation) with it");
+        const az = Number(args.azimuth ?? 0);
+        const el = Number(args.elevation ?? 0);
+        const lens = args.lens != null ? Number(args.lens) : null;
+        if (angled && (!Number.isFinite(az) || !Number.isFinite(el) || el < -90 || el > 90))
+          return text("error: azimuth is degrees around the subject (0 front, 90 right, 180 back), elevation -90…90 degrees (+ from above)");
+        if (lens != null && !(lens >= 1 && lens <= 5000)) return text("error: lens is the focal length in mm, e.g. 35 (wide) to 135 (long)");
+        const gamePx = args.game_px != null ? Math.round(Number(args.game_px)) : 0;
+        if (args.game_px != null && !(gamePx >= 8 && gamePx <= 2048)) return text("error: game_px is the longest side in game pixels, 8–2048 (e.g. 64 for an icon, 256 for a sprite)");
+        views = views.filter((v) => v !== "custom").slice(0, 6);
+        if (angled) views.push("custom");
+        if (!views.length && !ref) views.push("camera");
+        const maxSize = Number(args.max_size) || 800;
         const box = await boxFor(call);
-        const views = [...new Set(parseList(args.views))].slice(0, 6);
-        if (!views.length) views.push("camera");
         const names = parseList(args.objects);
+        // the orthographic views of one call get one scale: the largest any of them needs
+        const orthoViews = views.filter((v) => ORTHO.has(v));
         const content = [];
         const lines = [];
+        const scales = [];
+        let busy = false;
         for (const view of views) {
+          let set;
           let r;
           try {
-            const set = await sbx(box, "POST", "/exec", { code: viewCameraCode(view, names), sync_s: 30, label: `preview camera: ${view}` });
+            set = await sbx(box, "POST", "/exec", {
+              code: py("preview", { do: "setup", view, objects: names, ortho_views: orthoViews, shading, ...(view === "custom" ? { azimuth: az, elevation: el, lens } : {}) }),
+              sync_s: 30,
+              label: `preview camera: ${view}`,
+            });
             if (set.status !== "done") {
               // the other views would fail the same way (a busy scene, a name that is not there)
-              lines.push(`${view}: ${set.status === "running" ? "the live scene is busy — a call is still running there; look after it finishes" : `error: ${String(set.error ?? "could not place the camera").split("\n")[0]}`}`);
+              busy = set.status === "running";
+              lines.push(`${view}: ${busy ? "the live scene is busy — a call is still running there; look after it finishes" : `error: ${firstLine(set.error ?? "could not place the camera")}`}`);
               break;
             }
-            r = await sbx(box, "POST", "/screenshot", { max_size: Number(args.max_size) || 800 });
+            r = await sbx(box, "POST", "/screenshot", { max_size: gamePx || maxSize });
           } finally {
-            await sbx(box, "POST", "/exec", { code: restoreCameraCode, sync_s: 30, label: "preview camera: restore" }).catch((e) => log.warn(`restore camera ${box.id}: ${e.message}`));
+            // the camera, the overrides and the world are put back after every view
+            await sbx(box, "POST", "/exec", { code: py("preview", { do: "restore" }), sync_s: 30, label: "preview camera: restore" }).catch((e) => log.warn(`restore camera ${box.id}: ${e.message}`));
           }
           if (r.error) {
             lines.push(`${view}: error: ${r.error}`);
             continue;
           }
-          const name = path.posix.basename(r.path).replace(/\.png$/i, view === "camera" ? ".png" : `-${view}.png`);
-          const saved = await pull(box, call, r.path, undefined, `Blender preview render (${view}, ${r.width}×${r.height}, Cycles CPU) of the live scene`, path.posix.join(`blender/${call.taskId ?? "chat"}`, "previews", name));
-          lines.push(`${view}: ${saved.rel} (${r.width}×${r.height}, ${r.elapsed_s} s)`);
-          // the picture itself, so the agent sees the scene in this step (cores
-          // that pass image blocks through); the path stays for handing it over
-          const abs = path.join(ctx.paths.workspaceArtifacts(call.workspace), saved.rel.replace(/^artifacts\//, ""));
-          const size = fs.existsSync(abs) ? fs.statSync(abs).size : 0;
-          if (size > 0 && size <= 4 * 1024 * 1024) content.push({ type: "image", data: fs.readFileSync(abs).toString("base64"), mimeType: "image/png" });
+          const info = bxOf(set) ?? {};
+          const detail = [];
+          let src = r.path;
+          let shown = `${r.width}×${r.height}`;
+          if (gamePx) {
+            const factor = Math.max(1, Math.round(maxSize / Math.max(r.width, r.height)));
+            const dst = r.path.replace(/\.png$/i, `-px${gamePx}.png`);
+            const up = await sbx(box, "POST", "/exec", { code: py("game_pixels", { src: r.path, dst, factor }), sync_s: 60, label: `preview pixels: ${view}` });
+            if (up.status === "done") {
+              src = dst;
+              shown = `${r.width}×${r.height} game px${factor > 1 ? `, shown ×${factor} with hard pixels` : ""}`;
+            } else detail.push(`not enlarged: ${firstLine(up.error ?? up.status)}`);
+          }
+          if (shading !== "material") detail.push(shading);
+          if (view === "custom") detail.push(`azimuth ${az}°, elevation ${el}°${info.lens ? `, ${Math.round(info.lens)} mm` : ""}`);
+          if (info.ortho_scale) scales.push({ view, m: info.ortho_scale / Math.max(r.width, r.height) });
+          const name = `${path.posix.basename(r.path).replace(/\.png$/i, "")}${view === "camera" ? "" : `-${view}`}${shading === "material" ? "" : `-${shading}`}${gamePx ? `-px${gamePx}` : ""}.png`;
+          const saved = await pull(box, call, src, undefined, `Blender preview render (${[view, ...detail].join(", ")}, ${shown}, Cycles CPU) of the live scene`, path.posix.join(`blender/${call.taskId ?? "chat"}`, "previews", name));
+          lines.push(`${view}: ${saved.rel} (${[shown, ...detail, `${r.elapsed_s} s`].join(", ")})`);
+          const pic = picture(call, saved.rel);
+          if (pic) content.push(pic);
+        }
+        if (scales.length) {
+          const unit = gamePx ? "1 game px" : "1 px";
+          const m = Math.max(...scales.map((s) => s.m));
+          lines.push(scales.length > 1 ? `${scales.map((s) => s.view).join(", ")}: one scale, ${unit} = ${mm(m)} — sizes compare directly across them` : `${scales[0].view}: ${unit} = ${mm(m)}`);
+        }
+        if (ref && busy) lines.push(`reference ${ref.view}: not compared — the live scene is busy`);
+        else if (ref) {
+          // a failure here costs the comparison, not the views already rendered
+          const c = await compare(box, call, ref, refFiles, names, maxSize).catch((e) => ({ lines: [`reference ${ref.view}: error: ${e.message}`] }));
+          const pic = c.rel ? picture(call, c.rel) : null;
+          if (pic) content.push(pic);
+          lines.push(...c.lines);
         }
         box.lastUse = Date.now();
         persist();
