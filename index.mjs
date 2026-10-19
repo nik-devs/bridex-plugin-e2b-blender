@@ -34,6 +34,10 @@ const API = "https://api.e2b.app";
 const POLL_MS = 10_000;
 const WATCH_MS = 20_000;
 const TEXT_CAP = 6000;
+// never uploaded with a script's folder (hidden files and folders never are either)
+const SKIP_DIRS = new Set(["node_modules", "__pycache__", "venv"]);
+// automatic stops save the scene this long before the sandbox's own timer runs out
+const SAVE_AHEAD_MS = 120_000;
 
 export default async function activate(ctx) {
   const { z, log } = ctx;
@@ -217,13 +221,21 @@ export default async function activate(ctx) {
   const ended = new Map();
   const notices = new Map();
 
-  function forget(key, reason) {
+  function forget(key, reason, saved = null) {
     const box = boxes[key];
     if (!box) return;
     recordSpend(box, reason);
     delete boxes[key];
     persist();
-    if (reason !== "blender_stop") ended.set(key, { reason, at: Date.now() });
+    if (reason !== "blender_stop") ended.set(key, { reason, at: Date.now(), saved });
+  }
+
+  /** Restart the sandbox's own stop timer: E2B stops it idle_s from now. */
+  async function touch(box) {
+    await e2b("POST", `/sandboxes/${box.id}/timeout`, { timeout: idleS });
+    box.lastUse = Date.now();
+    box.expiresAt = Date.now() + idleS * 1000;
+    persist();
   }
 
   async function boxFor(call) {
@@ -231,9 +243,7 @@ export default async function activate(ctx) {
     const have = boxes[key];
     if (have) {
       try {
-        await e2b("POST", `/sandboxes/${have.id}/timeout`, { timeout: idleS });
-        have.lastUse = Date.now();
-        persist();
+        await touch(have);
         return have;
       } catch (e) {
         if (e.status !== 404) throw e;
@@ -260,6 +270,7 @@ export default async function activate(ctx) {
       sessionKey: call.sessionKey ?? null,
       createdAt: Date.now(),
       lastUse: Date.now(),
+      expiresAt: Date.now() + idleS * 1000,
     };
     boxes[key] = box;
     persist();
@@ -268,7 +279,13 @@ export default async function activate(ctx) {
     if (prev) {
       ended.delete(key);
       const mins = Math.round((Date.now() - prev.at) / 60_000);
-      notices.set(key, `[A NEW sandbox was started: the previous one stopped${mins >= 1 ? ` ${mins} min ago` : ""} (${prev.reason}). The scene and /work are EMPTY — redo the setup and push the files again before going on.]`);
+      notices.set(
+        key,
+        `[A NEW sandbox was started: the previous one stopped${mins >= 1 ? ` ${mins} min ago` : ""} (${prev.reason}). The scene and /work are EMPTY` +
+          (prev.saved
+            ? ` — its scene was saved before it stopped: ${prev.saved}. To go on from it, blender_push it and append its objects into the live scene (bpy.data.libraries.load), or run background jobs with scene="/work/in/autosave.blend"; files of /work were not saved — push again what you need.]`
+            : ` — redo the setup and push the files again before going on.]`),
+      );
     }
     return box;
   }
@@ -280,18 +297,31 @@ export default async function activate(ctx) {
     const r = path.relative(root, p);
     return r === "" || (!r.startsWith("..") && !path.isAbsolute(r));
   };
-  /** A workspace file: artifacts/…, a skill's file (<skill>/scripts/x.py), or an absolute path in the workspace. */
-  function workspaceFile(ws, p) {
+  /**
+   * A workspace file: artifacts/…, a skill's file (<skill>/scripts/x.py — the
+   * shared library or the agent's own skills), a path in the task's checkout or
+   * the working directory, or an absolute path in the workspace. Relative paths
+   * from a task's checkout used to fail «file not found» (only artifacts and the
+   * shared skills were looked at), so agents copied inputs around by hand.
+   */
+  function workspaceFile(call, p) {
     const s = String(p);
+    const ws = call.workspace;
     const wsRoot = path.join(ctx.paths.home, "workspaces", ws);
-    const abs = s.startsWith("artifacts/")
-      ? path.join(artifactsRoot(ws), s.slice("artifacts/".length))
+    const candidates = s.startsWith("artifacts/")
+      ? [path.join(artifactsRoot(ws), s.slice("artifacts/".length))]
       : path.isAbsolute(s)
-        ? s
-        : path.join(ctx.paths.workspaceSkills(ws), s);
-    if (!inside(abs, wsRoot)) throw new Error(`not a file in this workspace: ${s}`);
-    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error(`file not found: ${s}`);
-    return abs;
+        ? [s]
+        : [
+            path.join(ctx.paths.workspaceSkills(ws), s),
+            path.join(wsRoot, "agents", String(call.agent), "skills", s),
+            ...(call.taskId ? [path.join(wsRoot, "work", String(call.taskId), s)] : []),
+            path.join(ctx.paths.workspaceWorkdir(ws), s),
+          ];
+    const allowed = candidates.filter((c) => inside(c, wsRoot));
+    if (!allowed.length) throw new Error(`not a file in this workspace: ${s}`);
+    for (const abs of allowed) if (fs.existsSync(abs) && fs.statSync(abs).isFile()) return abs;
+    throw new Error(`file not found: ${s} (looked in ${allowed.map((c) => path.relative(wsRoot, c)).join(", ")})`);
   }
 
   async function push(box, abs, dest) {
@@ -300,13 +330,13 @@ export default async function activate(ctx) {
     return { dest, size: data.length };
   }
 
-  async function pull(box, call, src, subdir, description) {
+  async function pull(box, call, src, subdir, description, relName) {
     const buf = await sbx(box, "GET", `/files?path=${encodeURIComponent(src)}`, undefined, "download");
     const folder = subdir || `blender/${call.taskId ?? "chat"}`;
     // keep the sandbox layout under /work (out/front/view0.png and out/back/view0.png
     // must not overwrite each other); files elsewhere keep their name
     const under = src.startsWith("/work/") ? src.slice("/work/".length) : path.posix.basename(src);
-    const rel = path.posix.join(folder, under);
+    const rel = relName ?? path.posix.join(folder, under);
     const abs = path.join(artifactsRoot(call.workspace), rel);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, buf);
@@ -349,18 +379,14 @@ export default async function activate(ctx) {
     return trackId;
   }
 
-  function settle(trackId, p, j, extra = "", { wake = true } = {}) {
+  function settle(trackId, p, j, extra = "", { wake = true, gone = false } = {}) {
     pending.delete(trackId);
     const ok = j && j.status === "done";
     // the agent is woken to collect the result: the idle clock starts NOW, not
     // at its last call before the render — a 12-minute render was followed by
     // the watcher stopping the sandbox 20 s later, /work and the frames gone
     const box = Object.values(boxes).find((b) => b.id === p.boxId);
-    if (box) {
-      box.lastUse = Date.now();
-      persist();
-      e2b("POST", `/sandboxes/${box.id}/timeout`, { timeout: idleS }).catch((e) => log.warn(`extend ${box.id} after job: ${e.message}`));
-    }
+    if (box) touch(box).catch((e) => log.warn(`extend ${box.id} after job: ${e.message}`));
     ctx.jobs.settle(trackId, ok ? { status: "succeeded", result: { elapsed_s: j.elapsed_s } } : { status: "failed", error: j?.error ?? extra });
     // the agent already read the result itself (blender_job) — a wake would only repeat it
     if (!wake) return;
@@ -372,7 +398,14 @@ export default async function activate(ctx) {
       prompt:
         `Blender job ${p.jobId} (${p.label}) ${ok ? "finished" : "FAILED"}${p.taskId ? ` — task ${p.taskId}` : ""}.\n` +
         (j ? fmt(j) : extra) +
-        `\n${ok ? `Pull the files you need into artifacts with blender_pull, then continue — the sandbox stays up ${Math.round(idleS / 60)} min from now without calls.` : "Fix the script and run it again, or report the blocker."}`,
+        `\n${
+          ok
+            ? `Pull the files you need into artifacts with blender_pull, then continue — the sandbox stays up ${Math.round(idleS / 60)} min from now without calls.`
+            : gone
+              ? // this notice can come late — after the agent already redid the work in a new sandbox
+                "The sandbox it ran in is gone — there is nothing to fix in the script. If you already started this work again in a new sandbox, do not start it once more: blender_job lists what is running now."
+              : "Fix the script and run it again, or report the blocker."
+        }`,
     });
   }
 
@@ -380,7 +413,7 @@ export default async function activate(ctx) {
     for (const [trackId, p] of [...pending]) {
       const box = Object.values(boxes).find((b) => b.id === p.boxId);
       if (!box) {
-        settle(trackId, p, null, "the sandbox stopped before the job finished (idle/max-life timeout or blender_stop) — nothing to collect");
+        settle(trackId, p, null, "the sandbox stopped before the job finished (idle/max-life timeout or blender_stop) — nothing to collect", { gone: true });
         continue;
       }
       try {
@@ -392,17 +425,62 @@ export default async function activate(ctx) {
     }
   }
 
+  /**
+   * Save the live scene into the task's artifacts before a timer stops the
+   * sandbox: the next one starts empty, and an agent away longer than idle_s
+   * (or working past max_life_s) lost the whole scene and rebuilt it from
+   * scratch. Only a scene some code built is saved, under one name per task
+   * (the next autosave replaces it); a busy scene is left alone.
+   */
+  async function autosave(box) {
+    if (!box.built) return null;
+    try {
+      // room for the save and the download, whatever the timer had left
+      await e2b("POST", `/sandboxes/${box.id}/timeout`, { timeout: 180 });
+      const fp = "/work/.bridex/autosave.blend";
+      const r = await sbx(box, "POST", "/exec", {
+        code: `import bpy, os\nif len(bpy.data.objects):\n    os.makedirs('/work/.bridex', exist_ok=True)\n    bpy.ops.wm.save_as_mainfile(filepath=${JSON.stringify(fp)}, copy=True)\n    print('saved')\nelse:\n    print('empty')`,
+        sync_s: 60,
+        label: "autosave before the sandbox stops",
+      });
+      if (r.status !== "done" || !String(r.result ?? "").includes("saved")) return null;
+      const who = { workspace: box.workspace, agent: box.agent, taskId: box.taskId ?? null };
+      const saved = await pull(box, who, fp, undefined, "Blender scene saved automatically before its sandbox stopped", `blender/${box.taskId ?? "chat"}/autosave.blend`);
+      log.info(`sandbox ${box.id}: scene saved to ${saved.rel} before stopping`);
+      return saved.rel;
+    } catch (e) {
+      log.warn(`autosave ${box.id}: ${e.message}`);
+      return null;
+    }
+  }
+
   async function watchOnce() {
     for (const [key, box] of Object.entries(boxes)) {
       const busy = [...pending.values()].some((p) => p.boxId === box.id);
       const age = (Date.now() - box.createdAt) / 1000;
+      const expires = box.expiresAt ?? box.lastUse + idleS * 1000;
       try {
-        if (age > maxLifeS) {
-          await e2b("DELETE", `/sandboxes/${box.id}`).catch(() => {});
-          forget(key, `max life ${maxLifeS}s`);
+        if (age * 1000 > maxLifeS * 1000 - SAVE_AHEAD_MS) {
+          // the longest life is a hard stop, a running render included — the scene is saved first
+          if (!box.lifeSaved) {
+            box.lifeSaved = (await autosave(box)) ?? "";
+            persist();
+          }
+          if (age > maxLifeS) {
+            await e2b("DELETE", `/sandboxes/${box.id}`).catch(() => {});
+            forget(key, `max life ${maxLifeS}s`, box.lifeSaved || null);
+          }
         } else if (busy) {
           // a render must not be cut by the idle timer
-          await e2b("POST", `/sandboxes/${box.id}/timeout`, { timeout: idleS });
+          await touch(box);
+        } else if (box.built && Date.now() > expires - SAVE_AHEAD_MS && Date.now() < expires) {
+          // save the scene while the sandbox is still up, then stop it
+          const seen = box.lastUse;
+          const saved = await autosave(box);
+          // a call that came in meanwhile keeps the sandbox going
+          if (box.lastUse !== seen || !boxes[key]) continue;
+          await e2b("DELETE", `/sandboxes/${box.id}`).catch(() => {});
+          forget(key, `idle ${idleS}s`, saved);
         } else if (Date.now() - box.lastUse > idleS * 1000 + 15_000) {
           // E2B's own timer should have stopped it; confirm and close the books
           await e2b("GET", `/sandboxes/${box.id}`).then(
@@ -488,6 +566,17 @@ export default async function activate(ctx) {
           notices.delete(key);
           r.content = [{ type: "text", text: notice }, ...r.content];
         }
+        const box = boxes[key];
+        if (box) {
+          // idle time counts from the end of a call: a long live call or a pull no longer eats into it
+          await touch(box).catch((e) => log.warn(`extend ${box.id}: ${e.message}`));
+          const left = maxLifeS - (Date.now() - box.createdAt) / 1000;
+          if (left < 900 && r && Array.isArray(r.content))
+            r.content.push({
+              type: "text",
+              text: `[This sandbox stops in ${Math.max(1, Math.round(left / 60))} min — its longest life is ${Math.round(maxLifeS / 60)} min. Before that its scene is saved to artifacts/blender/${call.taskId ?? "chat"}/autosave.blend (unless code is running then); /work is not saved — blender_pull what you need now. Work that will not fit: blender_stop with save_blend, then go on in a new sandbox.]`,
+            });
+        }
         return r;
       },
     });
@@ -503,13 +592,14 @@ export default async function activate(ctx) {
   register({
     name: "blender_python",
     description:
-      `Run Python in Blender (bpy) in your own cloud sandbox — the scene lives across calls for this task; the first call starts the sandbox (~2 s). Give inline \`code\`, or a \`script\` file from your workspace (a skill's <skill>/scripts/x.py, or artifacts/...) with \`argv\` — the script's folder is uploaded next to it and it runs as __main__ with sys.argv = [script, *argv]. print() output and the full traceback come back.\n` +
+      `Run Python in Blender (bpy) in your own cloud sandbox — the scene lives across calls for this task; the first call starts the sandbox (~2 s). Give inline \`code\`, or a \`script\` file from your workspace (a skill's <skill>/scripts/x.py, artifacts/..., or a file of your task's checkout) with \`argv\` — the script's folder, subfolders included, is uploaded next to it and it runs as __main__ with sys.argv = [script, *argv]. print() output and the full traceback come back.\n` +
       `Timing — you never have to guess whether something fits: in the live scene the call waits up to ${syncS} s; if the code is still running then (a big render, a bake), it continues as a background job and you get its id — END your run, you will be woken with the result. For work you already know is long (renders from several angles, exports of many files, simulations), pass background=true: a separate Blender process runs on a copy of the current scene (scene="current", or "empty", or a .blend path in the sandbox) while the live scene stays free; it wakes you when done. The copy is taken when the live scene is free — if live code is still running, the background job starts after it (scene="empty" or a .blend starts at once). Every result reports elapsed seconds — note typical durations for next time.\n` +
-      `Write outputs under /work (e.g. /work/out/…), then blender_pull them into artifacts. Only the scene persists between calls, not Python variables.\n` +
+      `Write outputs under /work (e.g. /work/out/…), then blender_pull them into artifacts. Only the scene persists between calls, not Python variables; modules your script's folder provides are imported fresh on every run, so an edited helper takes effect.\n` +
+      `The sandbox has no GPU: render with Cycles (low samples for previews); EEVEE is very slow here. In the live scene avoid edit mode (bpy.ops.object.mode_set(mode='EDIT')) — it has crashed the sandbox: build meshes with bmesh, edit armatures with background=true, scene="empty".\n` +
       `Look as you go: after each meaningful step (the blockout, proportions, a new part, UVs, the rig) take blender_preview from two or three angles and hold it against the reference before the next step — a mistake seen at the blockout costs one call, the same one found at the art gate costs a round.`,
     schema: {
       code: z.string().optional().describe("inline Python (bpy is imported for you in the live scene)"),
-      script: z.string().optional().describe("a .py file in your workspace: <skill>/scripts/file.py or artifacts/..."),
+      script: z.string().optional().describe("a .py file in your workspace: <skill>/scripts/file.py, artifacts/..., or a path in your task's checkout or working directory (relative or absolute) — its folder goes along, subfolders too"),
       argv: z.array(z.string()).optional().describe("arguments for the script (sys.argv[1:])"),
       background: z.boolean().optional().describe("run in a separate `blender -b` process as a background job (long renders/exports)"),
       scene: z.string().optional().describe('background only: "current" (default — a copy of the live scene), "empty", or a .blend path in the sandbox'),
@@ -517,29 +607,65 @@ export default async function activate(ctx) {
     async handler(args, call) {
       try {
         if (!args.code && !args.script) return text("error: pass code or script");
+        const scriptAbs = args.script ? workspaceFile(call, args.script) : null;
+        // a factory reset in the live scene unloads the sandbox's own add-on: the scene stops answering
+        const source = (args.code ?? (scriptAbs ? fs.readFileSync(scriptAbs, "utf8") : "")).split("\n").filter((l) => !l.trim().startsWith("#"));
+        if (!args.background && source.some((l) => /\bread_(factory_settings|homefile)\s*\(/.test(l)))
+          return text("error: read_factory_settings / read_homefile in the live scene unloads the sandbox's add-on and the scene stops answering. Clear the scene by removing bpy.data blocks (objects, meshes, materials, images, cameras, lights, worlds), or run this with background=true, scene=\"empty\".");
         const box = await boxFor(call);
         const argv = parseList(args.argv);
         let scriptPath = null;
+        let remoteDir = null;
         let uploaded = "";
-        if (args.script) {
-          const abs = workspaceFile(call.workspace, args.script);
-          const dir = path.dirname(abs);
+        if (scriptAbs) {
+          const dir = path.dirname(scriptAbs);
           // named after the skill (<skill>/scripts/x.py → /work/scripts/<skill>), else the folder
-          const skillRel = path.relative(ctx.paths.workspaceSkills(call.workspace), abs);
+          const skillRel = path.relative(ctx.paths.workspaceSkills(call.workspace), scriptAbs);
           const label = !skillRel.startsWith("..") && !path.isAbsolute(skillRel) ? skillRel.split(path.sep)[0] : path.basename(dir);
-          const remoteDir = `/work/scripts/${label}`;
-          // the whole script folder: helpers the script imports come along (capped)
-          const files = fs.readdirSync(dir).filter((f) => fs.statSync(path.join(dir, f)).isFile()).slice(0, 60);
+          remoteDir = `/work/scripts/${label}`;
+          // the whole script folder with its subfolders (data next to the script used to stay
+          // behind); hidden files (.env) and dependency folders never go; unchanged files go once
+          const files = [];
+          const walk = (d, depth) => {
+            for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+              if (files.length >= 400) return;
+              if (e.name.startsWith(".") || SKIP_DIRS.has(e.name)) continue;
+              const fp = path.join(d, e.name);
+              if (e.isDirectory()) {
+                if (depth < 4) walk(fp, depth + 1);
+              } else if (e.isFile()) files.push(fp);
+            }
+          };
+          walk(dir, 0);
+          box.sent ??= {};
           let bytes = 0;
+          let sent = 0;
+          let same = 0;
+          let skipped = 0;
           for (const f of files) {
-            const size = fs.statSync(path.join(dir, f)).size;
-            if (size > 20 * 1024 ** 2 || bytes + size > 60 * 1024 ** 2) continue;
-            bytes += size;
-            await push(box, path.join(dir, f), `${remoteDir}/${f}`);
+            const st = fs.statSync(f);
+            if (st.size > 20 * 1024 ** 2 || bytes + st.size > 80 * 1024 ** 2) {
+              skipped++;
+              continue;
+            }
+            bytes += st.size;
+            const remote = `${remoteDir}/${path.relative(dir, f).split(path.sep).join("/")}`;
+            const stamp = `${st.size}:${Math.round(st.mtimeMs)}`;
+            if (box.sent[remote] === stamp) {
+              same++;
+              continue;
+            }
+            await push(box, f, remote);
+            box.sent[remote] = stamp;
+            sent++;
           }
-          scriptPath = `${remoteDir}/${path.basename(abs)}`;
-          uploaded = `uploaded ${files.length} file(s) from ${path.basename(dir)}/ to ${remoteDir}\n`;
+          scriptPath = `${remoteDir}/${path.relative(dir, scriptAbs).split(path.sep).join("/")}`;
+          uploaded =
+            `uploaded ${sent} file(s) from ${path.basename(dir)}/ to ${remoteDir}${same ? ` (${same} unchanged already there)` : ""}` +
+            `${skipped ? `, ${skipped} skipped (over 20 MB each or 80 MB in all)` : ""}${files.length >= 400 ? " — the folder has over 400 files, the rest stayed behind" : ""}\n`;
         }
+        // a background job works on its own copy: only live work changes what an autosave would keep
+        if (!args.background) box.built = true;
         let j;
         if (args.background) {
           j = await sbx(box, "POST", "/spawn", {
@@ -550,8 +676,21 @@ export default async function activate(ctx) {
             label: args.script ? path.basename(String(args.script)) : "inline",
           });
         } else {
+          // modules the script's folder provides are imported fresh on every run: the live
+          // scene kept them in sys.modules, and an edited helper silently ran its old code
           const code = scriptPath
-            ? `import sys, runpy\nsys.path.insert(0, ${JSON.stringify(path.posix.dirname(scriptPath))})\nsys.argv = ${JSON.stringify([scriptPath, ...argv])}\nrunpy.run_path(${JSON.stringify(scriptPath)}, run_name="__main__")`
+            ? [
+                "import sys, runpy",
+                `_bx_root = ${JSON.stringify(remoteDir)}`,
+                "for _bx_k, _bx_m in list(sys.modules.items()):",
+                "    if (getattr(_bx_m, '__file__', None) or '').startswith(_bx_root + '/'):",
+                "        del sys.modules[_bx_k]",
+                `_bx_dir = ${JSON.stringify(path.posix.dirname(scriptPath))}`,
+                "if _bx_dir not in sys.path:",
+                "    sys.path.insert(0, _bx_dir)",
+                `sys.argv = ${JSON.stringify([scriptPath, ...argv])}`,
+                `runpy.run_path(${JSON.stringify(scriptPath)}, run_name="__main__")`,
+              ].join("\n")
             : args.code;
           j = await sbx(box, "POST", "/exec", { code, sync_s: syncS, label: args.script ? path.basename(String(args.script)) : "inline" });
         }
@@ -579,7 +718,8 @@ export default async function activate(ctx) {
         const box = boxes[keyOf(call)];
         if (!box) return text("no sandbox for this task (it starts on the first blender_* call)");
         if (!args.job_id) {
-          const all = await sbx(box, "GET", "/jobs");
+          // the plugin's own short calls (preview cameras, the autosave) are not the agent's jobs
+          const all = (await sbx(box, "GET", "/jobs")).filter((j) => !/^(preview camera|autosave)/.test(String(j.label ?? "")));
           return text(all.length ? all.map((j) => `${j.id} ${j.kind} ${j.status}${j.phase ? ` (${j.phase})` : ""} ${j.elapsed_s}s — ${j.label}`).join("\n") : "no jobs yet");
         }
         const j = args.cancel ? await sbx(box, "POST", `/jobs/${args.job_id}/cancel`, {}) : await sbx(box, "GET", `/jobs/${args.job_id}`);
@@ -592,26 +732,130 @@ export default async function activate(ctx) {
     },
   });
 
+  // where a preview camera looks FROM (Blender's front view looks from -Y); the side and top views are orthographic
+  const VIEWS = {
+    front: [0, -1, 0],
+    back: [0, 1, 0],
+    left: [-1, 0, 0],
+    right: [1, 0, 0],
+    top: [0, 0, 1],
+    three_quarter: [1, -1.2, 0.8],
+  };
+  const ORTHO = new Set(["front", "back", "left", "right", "top"]);
+  /**
+   * A temporary camera framing what is visible (or the named objects/collections)
+   * from one side. Fitted to the frame in both directions: the template's own
+   * automatic camera fits a sphere to the wide side of a 16:9 frame, so a tall
+   * character lost its head and feet.
+   */
+  const viewCameraCode = (view, names) => `import bpy, math, mathutils
+sc = bpy.context.scene
+names = set(${JSON.stringify(names)})
+view = ${JSON.stringify(view)}
+if view == "camera" and sc.camera:
+    print("scene camera")
+else:
+    if view == "camera":
+        view = "three_quarter"
+    def wanted(o):
+        return not names or o.name in names or any(c.name in names for c in o.users_collection)
+    obs = [o for o in sc.objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT'} and o.visible_get() and wanted(o)]
+    if not obs:
+        raise RuntimeError("nothing visible to frame" + (": no visible object or collection named " + ", ".join(sorted(names)) if names else " in the scene"))
+    pts = [o.matrix_world @ mathutils.Vector(c) for o in obs for c in o.bound_box]
+    lo = mathutils.Vector([min(p[i] for p in pts) for i in range(3)])
+    hi = mathutils.Vector([max(p[i] for p in pts) for i in range(3)])
+    center = (lo + hi) / 2
+    radius = max((hi - lo).length / 2, 1e-4)
+    dirs = ${JSON.stringify(VIEWS)}
+    d = mathutils.Vector(dirs[view]).normalized()
+    data = bpy.data.cameras.new("bx_view_cam")
+    cam = bpy.data.objects.new("bx_view_cam", data)
+    sc.collection.objects.link(cam)
+    cam.location = center + d * radius * 4
+    cam.rotation_euler = (0.0, 0.0, 0.0) if view == "top" else (-d).to_track_quat('-Z', 'Y').to_euler()
+    rot = cam.rotation_euler.to_matrix()
+    right, up, back = rot @ mathutils.Vector((1, 0, 0)), rot @ mathutils.Vector((0, 1, 0)), rot @ mathutils.Vector((0, 0, 1))
+    rel = [p - center for p in pts]
+    r = sc.render
+    aspect = (r.resolution_x or 1920) / (r.resolution_y or 1080)
+    if view in ${JSON.stringify([...ORTHO])}:
+        w = max(abs(p.dot(right)) for p in rel) * 2
+        h = max(abs(p.dot(up)) for p in rel) * 2
+        data.type = 'ORTHO'
+        data.ortho_scale = max(w, h * aspect) * 1.08 if aspect >= 1 else max(h, w / aspect) * 1.08
+        dist = radius * 4
+    else:
+        t = math.tan(data.angle / 2)
+        tan_h, tan_v = (t, t / aspect) if aspect >= 1 else (t * aspect, t)
+        dist = max(max(p.dot(back) + abs(p.dot(right)) * 1.06 / tan_h, p.dot(back) + abs(p.dot(up)) * 1.06 / tan_v) for p in rel)
+    cam.location = center + back * dist
+    data.clip_start = max(min(0.1, (dist - radius) * 0.5), 1e-4)
+    data.clip_end = (dist + radius) * 2
+    bpy.app.driver_namespace["bx_view"] = (sc.camera.name if sc.camera else "", cam.name)
+    sc.camera = cam
+    print("view camera")`;
+  const restoreCameraCode = `import bpy
+sc = bpy.context.scene
+prev, made = bpy.app.driver_namespace.pop("bx_view", ("", ""))
+if made:
+    sc.camera = bpy.data.objects.get(prev) if prev else None
+    cam = bpy.data.objects.get(made)
+    if cam:
+        data = cam.data
+        bpy.data.objects.remove(cam, do_unlink=True)
+        bpy.data.cameras.remove(data)
+print("restored")`;
+
   register({
     name: "blender_preview",
-    description: "Look at the live scene: a quick Cycles CPU render (through the scene camera, or an automatic camera framing everything, with a temporary sun if there are no lights) saved into your artifacts and returned as a picture you see right away (its path too, to hand it over). A few seconds at 800 px. Use it after every meaningful step, from several angles — move the camera with blender_python between previews (front three-quarter, side, back, top) — not only before handing over.",
-    schema: { max_size: z.number().optional().describe("longest side in px, default 800") },
+    description:
+      "Look at the live scene: a quick Cycles CPU render saved into your artifacts and returned as a picture you see right away (its path too, to hand it over). " +
+      'views: "camera" — the scene camera, or without one a three-quarter view framing everything — and front / back / left / right / top (orthographic: proportions and silhouettes against an ortho sheet) / three_quarter; several in one call. ' +
+      "objects frames just those objects or collections (the rest stays in the picture). A few seconds per view at 800 px, with a temporary sun when the scene has no lights; the scene's own camera stays as it was. " +
+      "Use it after every meaningful step from two or three angles (e.g. three_quarter, front, right), not only before handing over.",
+    schema: {
+      views: z.array(z.enum(["camera", "front", "back", "left", "right", "top", "three_quarter"])).optional().describe('default ["camera"]; up to 6'),
+      objects: z.array(z.string()).optional().describe("object or collection names to frame; default everything visible"),
+      max_size: z.number().optional().describe("longest side in px, default 800"),
+    },
     async handler(args, call) {
       try {
         const box = await boxFor(call);
-        const r = await sbx(box, "POST", "/screenshot", { max_size: Number(args.max_size) || 800 });
-        if (r.error) return text(`error: ${r.error}`);
-        const saved = await pull(box, call, r.path, undefined, `Blender preview render (${r.width}×${r.height}, Cycles CPU) of the live scene`);
+        const views = [...new Set(parseList(args.views))].slice(0, 6);
+        if (!views.length) views.push("camera");
+        const names = parseList(args.objects);
+        const content = [];
+        const lines = [];
+        for (const view of views) {
+          let r;
+          try {
+            const set = await sbx(box, "POST", "/exec", { code: viewCameraCode(view, names), sync_s: 30, label: `preview camera: ${view}` });
+            if (set.status !== "done") {
+              // the other views would fail the same way (a busy scene, a name that is not there)
+              lines.push(`${view}: ${set.status === "running" ? "the live scene is busy — a call is still running there; look after it finishes" : `error: ${String(set.error ?? "could not place the camera").split("\n")[0]}`}`);
+              break;
+            }
+            r = await sbx(box, "POST", "/screenshot", { max_size: Number(args.max_size) || 800 });
+          } finally {
+            await sbx(box, "POST", "/exec", { code: restoreCameraCode, sync_s: 30, label: "preview camera: restore" }).catch((e) => log.warn(`restore camera ${box.id}: ${e.message}`));
+          }
+          if (r.error) {
+            lines.push(`${view}: error: ${r.error}`);
+            continue;
+          }
+          const name = path.posix.basename(r.path).replace(/\.png$/i, view === "camera" ? ".png" : `-${view}.png`);
+          const saved = await pull(box, call, r.path, undefined, `Blender preview render (${view}, ${r.width}×${r.height}, Cycles CPU) of the live scene`, path.posix.join(`blender/${call.taskId ?? "chat"}`, "previews", name));
+          lines.push(`${view}: ${saved.rel} (${r.width}×${r.height}, ${r.elapsed_s} s)`);
+          // the picture itself, so the agent sees the scene in this step (cores
+          // that pass image blocks through); the path stays for handing it over
+          const abs = path.join(ctx.paths.workspaceArtifacts(call.workspace), saved.rel.replace(/^artifacts\//, ""));
+          const size = fs.existsSync(abs) ? fs.statSync(abs).size : 0;
+          if (size > 0 && size <= 4 * 1024 * 1024) content.push({ type: "image", data: fs.readFileSync(abs).toString("base64"), mimeType: "image/png" });
+        }
         box.lastUse = Date.now();
         persist();
-        const line = `preview: ${saved.rel} (${r.width}×${r.height}, ${r.elapsed_s} s)`;
-        // the picture itself, so the agent sees the scene in this step (cores
-        // that pass image blocks through); the path stays for handing it over
-        const abs = path.join(ctx.paths.workspaceArtifacts(call.workspace), saved.rel);
-        const size = fs.existsSync(abs) ? fs.statSync(abs).size : 0;
-        if (size > 0 && size <= 4 * 1024 * 1024)
-          return { content: [{ type: "image", data: fs.readFileSync(abs).toString("base64"), mimeType: "image/png" }, { type: "text", text: line }] };
-        return text(line);
+        return { content: [...content, { type: "text", text: lines.join("\n") }] };
       } catch (e) {
         return fail(e);
       }
@@ -620,9 +864,9 @@ export default async function activate(ctx) {
 
   register({
     name: "blender_push",
-    description: "Copy files from your workspace (artifacts/... or a skill's files) into the sandbox, e.g. textures, references, a .blend to open. They land in `to` (default /work/in).",
+    description: "Copy files from your workspace into the sandbox — artifacts/..., a skill's files, or files of your task's checkout or working directory (relative or absolute) — e.g. textures, references, a .blend to open. They land in `to` (default /work/in).",
     schema: {
-      paths: z.array(z.string()).describe("workspace files: artifacts/... or <skill>/..."),
+      paths: z.array(z.string()).describe("workspace files: artifacts/..., <skill>/..., or a path in your task's checkout / working directory"),
       to: z.string().optional().describe("folder in the sandbox, default /work/in"),
     },
     async handler(args, call) {
@@ -631,7 +875,7 @@ export default async function activate(ctx) {
         const to = String(args.to || "/work/in").replace(/\/+$/, "");
         const out = [];
         for (const p of parseList(args.paths)) {
-          const r = await push(box, workspaceFile(call.workspace, p), `${to}/${path.basename(String(p))}`);
+          const r = await push(box, workspaceFile(call, p), `${to}/${path.basename(String(p))}`);
           out.push(`${p} → ${r.dest} (${r.size} B)`);
         }
         return text(out.join("\n"));
@@ -643,7 +887,7 @@ export default async function activate(ctx) {
 
   register({
     name: "blender_pull",
-    description: "Bring files out of the sandbox into this task's artifacts (renders, .glb/.fbx/.blend exports) — with provenance, visible in the dashboard. Pass exact sandbox paths, or a folder to take everything in it (e.g. /work/out). Call it before the sandbox stops: its files are gone after.",
+    description: "Bring files out of the sandbox into this task's artifacts (renders, .glb/.fbx/.blend exports) — with provenance, visible in the dashboard. A file lands in `to` under its own name; a folder brings everything inside it into `to` (its subfolders kept), up to 500 files — more than that, zip them in the sandbox and pull the .zip. Everything means earlier runs' files too (a failed or cancelled build's): give each build its own output folder, or clear it when a build starts. Call it before the sandbox stops: its files are gone after.",
     schema: {
       paths: z.array(z.string()).describe("sandbox file paths or folders, e.g. /work/out/front.png or /work/out"),
       to: z.string().optional().describe("artifacts subfolder, default blender/<task>"),
@@ -652,23 +896,33 @@ export default async function activate(ctx) {
       try {
         const box = boxes[keyOf(call)];
         if (!box) return text("error: no sandbox for this task — nothing to pull");
-        const files = [];
+        const dest = args.to ? String(args.to).replace(/^artifacts\//, "").replace(/\/+$/, "") : `blender/${call.taskId ?? "chat"}`;
+        const plan = [];
+        let truncated = false;
         for (const p of parseList(args.paths)) {
-          if (/\.[a-z0-9]{1,5}$/i.test(p)) files.push(p);
+          if (/\.[a-z0-9]{1,5}$/i.test(p)) plan.push({ src: p, rel: path.posix.basename(p) });
           else {
-            const ls = await sbx(box, "GET", `/ls?path=${encodeURIComponent(p)}`);
-            files.push(...(ls.items ?? []).map((i) => i.path));
+            // the folder's contents go straight into `to` — the /work path used to come along
+            // (/work/out/r → artifacts/<to>/out/r/…) and every agent had to work around it
+            const base = String(p).replace(/\/+$/, "");
+            const ls = await sbx(box, "GET", `/ls?path=${encodeURIComponent(base)}`);
+            truncated ||= Boolean(ls.truncated);
+            for (const i of ls.items ?? []) plan.push({ src: i.path, rel: path.posix.relative(base, i.path) });
           }
         }
-        if (!files.length) return text("nothing found at those paths");
+        if (!plan.length) return text("nothing found at those paths");
         const out = [];
-        for (const f of files.slice(0, 100)) {
-          const r = await pull(box, call, f, args.to ? String(args.to).replace(/^artifacts\//, "") : undefined);
+        for (const f of plan) {
+          const r = await pull(box, call, f.src, undefined, undefined, path.posix.join(dest, f.rel));
           out.push(`${r.rel} (${Math.round(r.size / 1024)} KB)`);
         }
         box.lastUse = Date.now();
         persist();
-        return text(`pulled into artifacts:\n${out.join("\n")}`);
+        const listed = out.length > 40 ? [...out.slice(0, 30), `… and ${out.length - 30} more in artifacts/${dest}/`] : out;
+        return text(
+          `pulled ${out.length} file(s) into artifacts:\n${listed.join("\n")}` +
+            (truncated ? "\nThe folder has more than 500 files — the rest stayed in the sandbox: zip them there (zipfile, background=true) and pull the .zip." : ""),
+        );
       } catch (e) {
         return fail(e);
       }
@@ -687,6 +941,8 @@ export default async function activate(ctx) {
         // the upstream tools require the user's words for their telemetry; there is none to give
         if (toolArgs.user_prompt === undefined) toolArgs.user_prompt = "";
         const content = await mcpCall(box, String(args.name), toolArgs);
+        // imports and texture changes build the scene too (worth saving before an automatic stop)
+        if (!/^(get_|search_|bpy_api_lookup|describe_)/.test(String(args.name))) box.built = true;
         box.lastUse = Date.now();
         persist();
         const out = [];
@@ -729,9 +985,10 @@ export default async function activate(ctx) {
         saved = `could not save the scene: ${e.message}\n`;
       }
       await e2b("DELETE", `/sandboxes/${box.id}`).catch(() => {});
-      for (const [tid, p] of [...pending]) if (p.boxId === box.id) settle(tid, p, null, "sandbox stopped by blender_stop");
       const mins = Math.round((Date.now() - box.createdAt) / 6000) / 10;
       forget(key, "blender_stop");
+      // the agent stopped it itself: a wake saying its jobs FAILED would only start a duplicate run
+      for (const [tid, p] of [...pending]) if (p.boxId === box.id) settle(tid, p, null, "sandbox stopped by blender_stop", { wake: false });
       return text(`${saved}sandbox stopped after ${mins} min`);
     },
   });
