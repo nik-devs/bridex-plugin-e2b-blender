@@ -95,6 +95,13 @@ export default async function activate(ctx) {
   const persist = () => fs.writeFileSync(stateFile, JSON.stringify(boxes, null, 2));
   /** jobs we poll: trackId → {box key, jobId, ...} */
   const pending = new Map();
+  /** jobs whose finish woke the agent: jobId → {boxId, workspace, agent} — taken back if the agent gets there first */
+  const woken = new Map();
+  const withdraw = (jobId, w) => {
+    woken.delete(jobId);
+    // hosts before withdrawWake keep the wake
+    ctx.withdrawWake?.({ workspace: w.workspace, agent: w.agent, key: `e2b-blender:${jobId}` });
+  };
 
   const e2b = async (method, p, body) => {
     const res = await fetch(`${API}${p}`, {
@@ -412,6 +419,8 @@ export default async function activate(ctx) {
     ctx.jobs.settle(trackId, ok ? { status: "succeeded", result: { elapsed_s: j.elapsed_s } } : { status: "failed", error: j?.error ?? extra });
     // the agent already read the result itself (blender_job) — a wake would only repeat it
     if (!wake) return;
+    woken.set(p.jobId, { boxId: p.boxId, workspace: p.workspace, agent: p.agent });
+    if (woken.size > 500) woken.delete(woken.keys().next().value);
     ctx.wakeAgent({
       workspace: p.workspace,
       agent: p.agent,
@@ -745,8 +754,16 @@ export default async function activate(ctx) {
           return text(all.length ? all.map((j) => `${j.id} ${j.kind} ${j.status}${j.phase ? ` (${j.phase})` : ""} ${j.elapsed_s}s — ${j.label}`).join("\n") : "no jobs yet");
         }
         const j = args.cancel ? await sbx(box, "POST", `/jobs/${args.job_id}/cancel`, {}) : await sbx(box, "GET", `/jobs/${args.job_id}`);
-        if (j.status && j.status !== "running")
+        if (j.status && j.status !== "running") {
           for (const [trackId, p] of [...pending]) if (p.boxId === box.id && p.jobId === args.job_id) settle(trackId, p, j, "", { wake: false });
+          // the poller may have seen it finish a moment earlier and woken the
+          // agent already: that wake waits for this run to end and then starts
+          // one about nothing new — a reflection's test bake woke the agent in
+          // the reflection session, and it went and redid a task its other run
+          // was on (chillbase, 2026-10-27)
+          const w = woken.get(args.job_id);
+          if (w && w.boxId === box.id) withdraw(args.job_id, w);
+        }
         return text(j.error && j.status === "running" ? `${j.error}\n${fmt(j)}` : fmt(j));
       } catch (e) {
         return fail(e);
@@ -1175,8 +1192,10 @@ export default async function activate(ctx) {
       await e2b("DELETE", `/sandboxes/${box.id}`).catch(() => {});
       const mins = Math.round((Date.now() - box.createdAt) / 6000) / 10;
       forget(key, "blender_stop");
-      // the agent stopped it itself: a wake saying its jobs FAILED would only start a duplicate run
+      // the agent stopped it itself: a wake saying its jobs FAILED would only start a duplicate run,
+      // and one saying a job finished points at files that went with the sandbox
       for (const [tid, p] of [...pending]) if (p.boxId === box.id) settle(tid, p, null, "sandbox stopped by blender_stop", { wake: false });
+      for (const [jobId, w] of [...woken]) if (w.boxId === box.id) withdraw(jobId, w);
       return text(`${saved}sandbox stopped after ${mins} min`);
     },
   });
